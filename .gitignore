@@ -1,0 +1,20 @@
+# Credenciais sensíveis
+client_secret_*.json
+*.json
+token.json
+.env
+secrets/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+build/
+
+# Sistema
+.DS_Store
+Thumbs.db

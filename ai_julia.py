@@ -19,10 +19,11 @@ image = (
         "google-auth",
         "google-auth-httplib2",
         "google-api-python-client",
+        "groq",
     ])
 )
 
-secrets = [modal.Secret.from_name("marina-secrets"), modal.Secret.from_name("google-calendar-secrets")]
+secrets = [modal.Secret.from_name("marina-secrets"), modal.Secret.from_name("google-calendar-secrets"), modal.Secret.from_name("groq-secrets")]
 
 CLAUDE_MODEL = "claude-haiku-4-5"
 
@@ -49,7 +50,7 @@ SCHEDULE_MEETING_TOOL = {
     },
 }
 
-AUDIO_MSG = "Recebi seu áudio! Ainda não consigo processar áudios. Por favor, me envie sua mensagem em texto que responderei imediatamente."
+AUDIO_MSG = "Recebi seu áudio, mas não consegui transcrever. Por favor, envie sua mensagem em texto."
 
 JULIA_SYSTEM_PROMPT = """# REGRA ABSOLUTA — ADVOGADO CONSTITUÍDO
 
@@ -486,17 +487,34 @@ def _claude_analyze_document(data: bytes) -> str:
     return next(b.text for b in resp.content if b.type == "text")
 
 
+def _transcribe_audio(data: bytes, mime_type: str) -> str:
+    from groq import Groq
+    import io
+
+    client = Groq(api_key=os.environ["GROQ_API_KEY"])
+    ext_map = {
+        "audio/ogg": "ogg", "audio/mpeg": "mp3", "audio/mp4": "mp4",
+        "audio/wav": "wav", "audio/webm": "webm", "audio/x-m4a": "m4a",
+    }
+    ext = ext_map.get(mime_type, "ogg")
+    transcription = client.audio.transcriptions.create(
+        file=(f"audio.{ext}", io.BytesIO(data), mime_type),
+        model="whisper-large-v3-turbo",
+        language="pt",
+    )
+    return transcription.text.strip()
+
+
 def _extract_text(file_type: str, content: str, data_url: str) -> str:
     if content:
         return content
     if not data_url:
         return ""
 
-    # Claude does not support audio input — handled separately in process_message
-    if file_type == "audio":
-        return ""
-
     data, mime = _fetch(data_url)
+
+    if file_type == "audio":
+        return _transcribe_audio(data, mime)
 
     if file_type == "image":
         return _claude_analyze_image(data, mime)
@@ -827,7 +845,6 @@ def _process(body: dict, redis_lib, psycopg2) -> None:
             json={"labels": ["ia_atendendo"]},
         )
 
-    # Extract plain text — audio returns "" since Claude has no audio input
     text_message = _extract_text(file_type, message_content, data_url)
     if not text_message:
         if file_type == "audio":

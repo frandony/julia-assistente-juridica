@@ -383,7 +383,7 @@ Se a pessoa não for um cliente buscando atendimento jurídico (ex: vendedor, pa
 - Se o cliente informar que mora fora de Vitória/ES, direcionar automaticamente para videochamada sem oferecer presencial
 - Quando o cliente confirmar nome completo, área, data, horário, formato e WhatsApp, use a ferramenta schedule_meeting para criar o evento antes de informar ao cliente
 - Sempre confirme a data completa com dia, mês e ano antes de chamar a ferramenta — nunca assuma o mês ou ano
-- Após agendamento online bem-sucedido, informe o link do Google Meet na mesma mensagem
+- Após agendamento online bem-sucedido, informe o link do Google Meet na mesma mensagem — mas SOMENTE se o meet_link vier preenchido no resultado da ferramenta. Se meet_link for null ou vazio, diga que o link será enviado pelo advogado responsável em breve, pelo WhatsApp
 - Se o agendamento falhar, informe que alguém do escritório confirmará o horário manualmente"""
 
 
@@ -765,7 +765,21 @@ def _schedule_meeting(
             ).execute()
             entry_points = (created.get("conferenceData") or {}).get("entryPoints", [])
             meet_link = next((ep.get("uri") for ep in entry_points if ep.get("entryPointType") == "video"), None)
-            # Update title and description to include meet code/link
+
+            # Validate that the meet link is complete (must have a code after the base URL)
+            if meet_link and meet_link.rstrip("/") == "https://meet.google.com":
+                meet_link = None
+
+            # If first attempt returned no valid link, fetch the event again (API may need a moment)
+            if not meet_link:
+                import time as _time
+                _time.sleep(2)
+                fetched = service.events().get(calendarId=calendar_id, eventId=created["id"]).execute()
+                entry_points = (fetched.get("conferenceData") or {}).get("entryPoints", [])
+                meet_link = next((ep.get("uri") for ep in entry_points if ep.get("entryPointType") == "video"), None)
+                if meet_link and meet_link.rstrip("/") == "https://meet.google.com":
+                    meet_link = None
+
             if meet_link:
                 meet_code = meet_link.rstrip("/").split("/")[-1]
                 service.events().patch(

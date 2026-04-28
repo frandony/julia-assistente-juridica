@@ -941,6 +941,10 @@ def _process(body: dict, redis_lib, psycopg2) -> None:
             json={"labels": ["ia_atendendo"]},
         )
 
+    # Imagens ficam com o advogado — não responder
+    if file_type == "image":
+        return
+
     text_message = _extract_text(file_type, message_content, data_url)
     if not text_message:
         if file_type == "audio":

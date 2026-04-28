@@ -650,7 +650,8 @@ def _call_julia(conn, session_id: str, user_message: str) -> str:
                 f"Não peça o WhatsApp — você já o tem. Use-o diretamente ao chamar schedule_meeting.\n"
                 f"Após agendar com sucesso, informe que a reunião está confirmada, envie o link do Meet se for online "
                 f"e também envie o link do agendamento: https://calendar.app.google/mPeSFcH6gFv5oBSHA\n"
-                f"Não diga que alguém entrará em contato para confirmar — o agendamento já está feito."
+                f"O agendamento já está feito — não diga que alguém entrará em contato para confirmar o horário. "
+                f"Informe que o advogado responsável entrará em contato no dia da consulta e algumas horas antes como cortesia."
             ),
         },
     ]
@@ -658,7 +659,7 @@ def _call_julia(conn, session_id: str, user_message: str) -> str:
     while True:
         resp = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=500,
+            max_tokens=800,
             system=system,
             tools=[SCHEDULE_MEETING_TOOL],
             messages=messages,

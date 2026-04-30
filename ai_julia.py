@@ -688,57 +688,59 @@ def _call_julia(conn, session_id: str, user_message: str, conversation_id: int) 
             messages=messages,
         )
 
-        tool_block = next((b for b in resp.content if b.type == "tool_use"), None)
+        tool_blocks = [b for b in resp.content if b.type == "tool_use"]
         text_block = next((b for b in resp.content if b.type == "text"), None)
 
-        if tool_block:
-            tool_name = tool_block.name
-            args = tool_block.input
+        if tool_blocks:
+            cw_url = os.environ["CHATWOOT_URL"]
+            cw_token = os.environ["CHATWOOT_TOKEN"]
+            cw_account = os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
 
-            if tool_name == "set_label":
-                label = args.get("label", "")
-                try:
-                    cw_url = os.environ["CHATWOOT_URL"]
-                    cw_token = os.environ["CHATWOOT_TOKEN"]
-                    cw_account = os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
-                    with httpx.Client() as http:
-                        http.post(
-                            f"{cw_url}/api/v1/accounts/{cw_account}/conversations/{conversation_id}/labels",
-                            headers={"api_access_token": cw_token, "Content-Type": "application/json"},
-                            json={"labels": [label]},
-                            timeout=10,
-                        )
-                    result = {"success": True, "label": label}
-                except Exception as e:
-                    result = {"success": False, "error": str(e)}
+            tool_results = []
+            for tool_block in tool_blocks:
+                tool_name = tool_block.name
+                args = tool_block.input
 
-            elif tool_name == "transfer_to_lawyer":
-                result = _transfer_to_lawyer(
-                    conversation_id=conversation_id,
-                    area=args["area"],
-                    subarea=args["subarea"],
-                    client_name=args["client_name"],
-                    client_whatsapp=args["client_whatsapp"],
-                    case_summary=args["case_summary"],
-                    qualification_notes=args["qualification_notes"],
-                    client_email=args.get("client_email", ""),
-                    client_city=args.get("client_city", ""),
-                    documents_requested=args.get("documents_requested", ""),
-                )
-                if result.get("success"):
-                    was_transferred = True
-            else:
-                result = {"success": False, "error": f"unknown tool: {tool_name}"}
+                if tool_name == "set_label":
+                    label = args.get("label", "")
+                    try:
+                        with httpx.Client() as http:
+                            http.post(
+                                f"{cw_url}/api/v1/accounts/{cw_account}/conversations/{conversation_id}/labels",
+                                headers={"api_access_token": cw_token, "Content-Type": "application/json"},
+                                json={"labels": [label]},
+                                timeout=10,
+                            )
+                        result = {"success": True, "label": label}
+                    except Exception as e:
+                        result = {"success": False, "error": str(e)}
 
-            messages.append({"role": "assistant", "content": resp.content})
-            messages.append({
-                "role": "user",
-                "content": [{
+                elif tool_name == "transfer_to_lawyer":
+                    result = _transfer_to_lawyer(
+                        conversation_id=conversation_id,
+                        area=args["area"],
+                        subarea=args["subarea"],
+                        client_name=args["client_name"],
+                        client_whatsapp=args["client_whatsapp"],
+                        case_summary=args["case_summary"],
+                        qualification_notes=args["qualification_notes"],
+                        client_email=args.get("client_email", ""),
+                        client_city=args.get("client_city", ""),
+                        documents_requested=args.get("documents_requested", ""),
+                    )
+                    if result.get("success"):
+                        was_transferred = True
+                else:
+                    result = {"success": False, "error": f"unknown tool: {tool_name}"}
+
+                tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": tool_block.id,
                     "content": json.dumps(result),
-                }],
-            })
+                })
+
+            messages.append({"role": "assistant", "content": resp.content})
+            messages.append({"role": "user", "content": tool_results})
             continue
 
         # No tool_use block — final text response

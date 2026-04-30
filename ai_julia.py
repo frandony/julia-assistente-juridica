@@ -946,8 +946,59 @@ def _process(body: dict, redis_lib, psycopg2) -> None:
             json={"labels": ["conversando"]},
         )
 
-    # Imagens ficam com o advogado — não responder
+    # --- Image debounce: coleta imagens e espera 10s desde a última ---
     if file_type == "image":
+        img_key = f"images:{session_id}"
+        r.rpush(img_key, json.dumps({"data_url": data_url, "id": msg_id, "enqueued_at": time.time()}))
+        r.expire(img_key, 300)
+
+        while True:
+            raw = r.lrange(img_key, 0, -1)
+            if not raw:
+                return
+            last = json.loads(raw[-1])
+            if last["id"] != msg_id:
+                return  # imagem mais recente chegou — deixa ela processar
+            if time.time() - last["enqueued_at"] >= 10:
+                break  # 10s de silêncio confirmado
+            time.sleep(2)
+
+        all_imgs = r.lrange(img_key, 0, -1)
+        r.delete(img_key)
+
+        img_texts = []
+        for raw_img in all_imgs:
+            img = json.loads(raw_img)
+            if img.get("data_url"):
+                try:
+                    data, mime = _fetch(img["data_url"])
+                    text = _claude_analyze_image(data, mime)
+                    if text:
+                        img_texts.append(text)
+                except Exception:
+                    pass
+
+        if not img_texts:
+            return
+
+        all_text = "\n\n".join(img_texts)
+
+        conn = psycopg2.connect(os.environ["POSTGRES_URL"])
+        try:
+            _init_db(conn)
+            ai_response, was_scheduled = _call_julia(conn, session_id, all_text)
+        finally:
+            conn.close()
+
+        _send_text(conversation_id, session_id, ai_response)
+
+        if was_scheduled:
+            with httpx.Client() as http:
+                http.post(
+                    f"{cw_url}/api/v1/accounts/{cw_account}/conversations/{conversation_id}/labels",
+                    headers={"api_access_token": cw_token},
+                    json={"labels": ["agendado"]},
+                )
         return
 
     text_message = _extract_text(file_type, message_content, data_url)
@@ -956,10 +1007,10 @@ def _process(body: dict, redis_lib, psycopg2) -> None:
             _send_text(conversation_id, session_id, AUDIO_MSG)
         return
 
-    # --- Redis debounce: collect rapid consecutive messages before responding ---
+    # --- Redis debounce: coleta mensagens rápidas e responde de uma vez ---
     r.rpush(
         session_id,
-        json.dumps({"textMessage": text_message, "id": msg_id, "timestamp": msg_timestamp}),
+        json.dumps({"textMessage": text_message, "id": msg_id, "enqueued_at": time.time()}),
     )
 
     while True:
@@ -969,18 +1020,14 @@ def _process(body: dict, redis_lib, psycopg2) -> None:
 
         last = json.loads(raw[-1])
 
-        # A newer message arrived — let that invocation handle the response
+        # Mensagem mais recente chegou — deixa ela processar
         if last["id"] != msg_id:
             return
 
-        try:
-            ts = datetime.fromisoformat(str(last["timestamp"]).replace("Z", "+00:00"))
-            if (datetime.now(timezone.utc) - ts) > timedelta(seconds=1):
-                break  # 1 s silence confirmed, proceed
-        except Exception:
-            break
+        if time.time() - last["enqueued_at"] >= 2:
+            break  # 2s de silêncio confirmado
 
-        time.sleep(1)
+        time.sleep(0.5)
 
     # Collect all queued messages and clear the queue
     all_text = "\n".join(json.loads(m)["textMessage"] for m in r.lrange(session_id, 0, -1))

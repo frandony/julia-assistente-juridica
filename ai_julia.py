@@ -656,15 +656,12 @@ def _call_julia(conn, session_id: str, user_message: str, conversation_id: int) 
             messages=messages,
         )
 
-        if resp.stop_reason == "end_turn":
-            ai_text = next(b.text for b in resp.content if b.type == "text")
-            _save_turn(conn, session_id, user_message, ai_text)
-            return ai_text, was_transferred
+        tool_block = next((b for b in resp.content if b.type == "tool_use"), None)
+        text_block = next((b for b in resp.content if b.type == "text"), None)
 
-        if resp.stop_reason == "tool_use":
-            tool_use_block = next(b for b in resp.content if b.type == "tool_use")
-            args = tool_use_block.input
-            tool_name = tool_use_block.name
+        if tool_block:
+            tool_name = tool_block.name
+            args = tool_block.input
 
             if tool_name == "set_label":
                 label = args.get("label", "")
@@ -706,14 +703,14 @@ def _call_julia(conn, session_id: str, user_message: str, conversation_id: int) 
                 "role": "user",
                 "content": [{
                     "type": "tool_result",
-                    "tool_use_id": tool_use_block.id,
+                    "tool_use_id": tool_block.id,
                     "content": json.dumps(result),
                 }],
             })
             continue
 
-        # Fallback: unexpected stop_reason
-        ai_text = next((b.text for b in resp.content if b.type == "text"), "")
+        # No tool_use block — final text response
+        ai_text = text_block.text if text_block else ""
         if ai_text:
             _save_turn(conn, session_id, user_message, ai_text)
         return ai_text, was_transferred

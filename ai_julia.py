@@ -165,7 +165,6 @@ Exemplos:
 - Coletar o nome do cliente no início e personalizar todo o atendimento
 - Verificar obrigatoriamente se o cliente já possui advogado constituído antes de qualquer orientação de mérito
 - Identificar a área do caso: Trabalhista ou Previdenciário
-- Identificar a área do caso: Trabalhista ou Previdenciário
 - Qualificar o cliente com perguntas estratégicas (SPIN), uma de cada vez
 - Se qualificado: usar a ferramenta transfer_to_lawyer para transferir ao advogado responsável
 - Se não qualificado: encerrar com respeito e orientar onde buscar ajuda
@@ -765,11 +764,15 @@ def _get_chatwoot_team_id(area: str) -> int | None:
                 headers={"api_access_token": token},
                 timeout=10,
             )
-            for team in resp.json():
+            data = resp.json()
+            print(f"[teams API] status={resp.status_code} data={str(data)[:300]}")
+            if isinstance(data, dict):
+                data = data.get("payload", [])
+            for team in data:
                 if target.lower() in team.get("name", "").lower():
                     return team["id"]
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[teams API error] {e}")
     return None
 
 
@@ -785,12 +788,16 @@ def _get_chatwoot_agent_id(area: str) -> int | None:
                 headers={"api_access_token": token},
                 timeout=10,
             )
-            for agent in resp.json():
+            data = resp.json()
+            print(f"[agents API] status={resp.status_code} data={str(data)[:300]}")
+            if isinstance(data, dict):
+                data = data.get("payload", [])
+            for agent in data:
                 name = agent.get("name", "").lower()
                 if target in name:
                     return agent["id"]
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[agents API error] {e}")
     return None
 
 
@@ -1001,30 +1008,26 @@ def _process(body: dict, redis_lib, psycopg2) -> None:
         return
 
     # --- Redis debounce: coleta mensagens rápidas e responde de uma vez ---
-    r.rpush(
-        session_id,
-        json.dumps({"textMessage": text_message, "id": msg_id, "enqueued_at": time.time()}),
-    )
+    last_key = f"last:{session_id}"
+    r.rpush(session_id, json.dumps({"textMessage": text_message, "id": msg_id}))
+    r.expire(session_id, 300)
+    r.set(last_key, msg_id, ex=30)  # atomic "eu sou o mais recente"
 
+    poll_start = time.time()
     while True:
-        raw = r.lrange(session_id, 0, -1)
-        if not raw:
-            return
+        current_last = r.get(last_key)
+        if current_last is None or current_last.decode() != msg_id:
+            return  # mensagem mais nova chegou, deixa ela processar
 
-        last = json.loads(raw[-1])
-
-        # Mensagem mais recente chegou — deixa ela processar
-        if last["id"] != msg_id:
-            return
-
-        if time.time() - last["enqueued_at"] >= 2:
-            break  # 2s de silêncio confirmado
+        if time.time() - poll_start >= 3:
+            break  # 3s de silêncio confirmado
 
         time.sleep(0.5)
 
     # Collect all queued messages and clear the queue
     all_text = "\n".join(json.loads(m)["textMessage"] for m in r.lrange(session_id, 0, -1))
     r.delete(session_id)
+    r.delete(last_key)
 
     # --- Call Claude and send response ---
     conn = psycopg2.connect(os.environ["POSTGRES_URL"])

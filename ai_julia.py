@@ -35,8 +35,8 @@ SET_LABEL_TOOL = {
         "properties": {
             "label": {
                 "type": "string",
-                "enum": ["investigação", "implicação"],
-                "description": "investigação: fase de coleta de informações via SPIN (perguntas sobre vínculo, INSS, documentos etc.). implicação: cliente qualificado, fase de geração de desejo antes da transferência.",
+                "enum": ["conversando", "investigação", "implicação"],
+                "description": "conversando: início de qualquer resposta (setar sempre na primeira mensagem). investigação: fase de coleta SPIN. implicação: cliente qualificado, antes da transferência.",
             }
         },
         "required": ["label"],
@@ -333,10 +333,11 @@ Dr. Rodolfo Amadeo
 
 Use a ferramenta set_label para atualizar a etiqueta da conversa conforme o estágio do atendimento:
 
+- **conversando**: acione na sua primeira resposta de qualquer conversa e sempre que retomar o diálogo normal
 - **investigação**: acione ao iniciar as perguntas SPIN de Situação e Problema — quando estiver coletando informações do caso (vínculo empregatício, situação com INSS, documentos, tempo de contribuição etc.)
 - **implicação**: acione quando o cliente já estiver qualificado e você estiver na fase de Desejo (AIDA) — destacando o valor do atendimento especializado, logo antes de usar transfer_to_lawyer
 
-Não use set_label para "conversando" (definido automaticamente a cada mensagem recebida) nem para "agendado" (definido automaticamente após transfer_to_lawyer bem-sucedido).
+Não use set_label para "agendado" — esse é definido automaticamente após transfer_to_lawyer bem-sucedido.
 
 # ÉTICA OAB — INTERNALIZADA, NÃO DECORADA
 
@@ -391,7 +392,7 @@ As regras abaixo não são decorativas. São limites que não podem ser ultrapas
 > Para aproveitarmos bem a reunião, pode me enviar aqui pelo WhatsApp os seguintes documentos antes do nosso encontro?
 
 ## Encerramento após transferência confirmada
-> Seu caso foi encaminhado para o [Dr. Rodolfo / Dra. Genaina], que entrará em contato com você pelo WhatsApp [+55 27 98118-8433 / +55 27 99953-6986] para dar sequência ao atendimento. Só lembrando que nossa conversa tem caráter informativo e não estabelece uma relação advocatícia formal.
+> Estou transferindo você para o [Dr. Rodolfo / Dra. Genaina] agora. Só lembrando que nossa conversa tem caráter informativo e não estabelece uma relação advocatícia formal.
 
 ## Encerramento sem agendamento
 > Só lembrando que nossa conversa tem caráter informativo e não estabelece uma relação advocatícia formal, tudo bem? Qualquer dúvida, estamos à disposição.
@@ -649,9 +650,10 @@ def _call_julia(conn, session_id: str, user_message: str, conversation_id: int) 
             "text": (
                 f"O número de WhatsApp do cliente nesta conversa é: {session_id}. "
                 f"Não peça o WhatsApp — você já o tem. Use-o diretamente ao chamar transfer_to_lawyer.\n"
-                f"Após transferir com sucesso, informe ao cliente que o caso foi encaminhado ao advogado responsável "
-                f"e que ele entrará em contato pelo WhatsApp. Inclua o aviso legal.\n"
-                f"Não pergunte data, horário ou formato de reunião — isso será definido pelo advogado."
+                f"Após transferir com sucesso, diga apenas que está transferindo para o advogado e inclua o aviso legal. "
+                f"Não mencione WhatsApp nem diga que alguém vai entrar em contato — o Chatwoot faz o redirecionamento.\n"
+                f"Não pergunte data, horário ou formato de reunião — isso será definido pelo advogado.\n"
+                f"Use set_label('conversando') na sua primeira resposta de cada conversa e atualize conforme o estágio."
             ),
         },
     ]
@@ -844,16 +846,18 @@ def _transfer_to_lawyer(
         )
 
         with httpx.Client() as http:
-            if team_id or agent_id:
-                payload = {}
-                if team_id:
-                    payload["team_id"] = team_id
-                if agent_id:
-                    payload["assignee_id"] = agent_id
+            if team_id:
                 http.patch(
                     f"{url}/api/v1/accounts/{account}/conversations/{conversation_id}",
                     headers={"api_access_token": token, "Content-Type": "application/json"},
-                    json=payload,
+                    json={"team_id": team_id},
+                    timeout=10,
+                )
+            if agent_id:
+                http.post(
+                    f"{url}/api/v1/accounts/{account}/conversations/{conversation_id}/assignments",
+                    headers={"api_access_token": token, "Content-Type": "application/json"},
+                    json={"assignee_id": agent_id},
                     timeout=10,
                 )
 
@@ -938,11 +942,6 @@ def _process(body: dict, redis_lib, psycopg2) -> None:
             f"{cw_url}/api/v1/accounts/{cw_account}/conversations/{conversation_id}/toggle_status",
             headers={"api_access_token": cw_token},
             json={"status": "open"},
-        )
-        http.post(
-            f"{cw_url}/api/v1/accounts/{cw_account}/conversations/{conversation_id}/labels",
-            headers={"api_access_token": cw_token},
-            json={"labels": ["conversando"]},
         )
 
     # --- Image debounce: coleta imagens e espera 10s desde a última ---

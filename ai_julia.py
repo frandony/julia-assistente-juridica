@@ -907,6 +907,11 @@ def _process(body: dict, redis_lib, psycopg2) -> None:
     if msg_type not in (0, "incoming"):
         return
 
+    # Ignore messages sent by human agents or the bot itself — only process customer messages
+    sender_type = (body.get("sender") or {}).get("type", "")
+    if sender_type in ("agent", "user", "agent_bot"):
+        return
+
     conversation = body.get("conversation") or {}
     conversation_id = conversation.get("id")
 

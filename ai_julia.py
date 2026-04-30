@@ -783,6 +783,27 @@ def _get_chatwoot_team_id(area: str) -> int | None:
     return None
 
 
+def _get_chatwoot_agent_id(area: str) -> int | None:
+    url = os.environ["CHATWOOT_URL"]
+    token = os.environ["CHATWOOT_TOKEN"]
+    account = os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
+    target = "rodolfo" if area == "trabalhista" else "genaina"
+    try:
+        with httpx.Client() as http:
+            resp = http.get(
+                f"{url}/api/v1/accounts/{account}/agents",
+                headers={"api_access_token": token},
+                timeout=10,
+            )
+            for agent in resp.json():
+                name = agent.get("name", "").lower()
+                if target in name:
+                    return agent["id"]
+    except Exception:
+        pass
+    return None
+
+
 def _transfer_to_lawyer(
     conversation_id: int,
     area: str,
@@ -804,6 +825,7 @@ def _transfer_to_lawyer(
 
     try:
         team_id = _get_chatwoot_team_id(area)
+        agent_id = _get_chatwoot_agent_id(area)
 
         email_line = f"\n- E-mail: {client_email}" if client_email else ""
         city_line = f"\n- Cidade/Estado: {client_city}" if client_city else ""
@@ -822,11 +844,16 @@ def _transfer_to_lawyer(
         )
 
         with httpx.Client() as http:
-            if team_id:
+            if team_id or agent_id:
+                payload = {}
+                if team_id:
+                    payload["team_id"] = team_id
+                if agent_id:
+                    payload["assignee_id"] = agent_id
                 http.patch(
                     f"{url}/api/v1/accounts/{account}/conversations/{conversation_id}",
                     headers={"api_access_token": token, "Content-Type": "application/json"},
-                    json={"team_id": team_id},
+                    json=payload,
                     timeout=10,
                 )
 

@@ -610,7 +610,7 @@ def _extract_text(file_type: str, content: str, data_url: str) -> str:
 # Helpers: AI agent (Júlia via Anthropic SDK with prompt caching)
 # ---------------------------------------------------------------------------
 
-def _call_julia(conn, session_id: str, user_message: str) -> str:
+def _call_julia(conn, session_id: str, user_message: str) -> tuple:
     import anthropic
 
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -656,6 +656,8 @@ def _call_julia(conn, session_id: str, user_message: str) -> str:
         },
     ]
 
+    was_scheduled = False
+
     while True:
         resp = client.messages.create(
             model=CLAUDE_MODEL,
@@ -668,7 +670,7 @@ def _call_julia(conn, session_id: str, user_message: str) -> str:
         if resp.stop_reason == "end_turn":
             ai_text = next(b.text for b in resp.content if b.type == "text")
             _save_turn(conn, session_id, user_message, ai_text)
-            return ai_text
+            return ai_text, was_scheduled
 
         if resp.stop_reason == "tool_use":
             tool_use_block = next(b for b in resp.content if b.type == "tool_use")
@@ -689,6 +691,9 @@ def _call_julia(conn, session_id: str, user_message: str) -> str:
                 documents_requested=args.get("documents_requested", ""),
             )
 
+            if result.get("success"):
+                was_scheduled = True
+
             messages.append({"role": "assistant", "content": resp.content})
             messages.append({
                 "role": "user",
@@ -704,7 +709,7 @@ def _call_julia(conn, session_id: str, user_message: str) -> str:
         ai_text = next((b.text for b in resp.content if b.type == "text"), "")
         if ai_text:
             _save_turn(conn, session_id, user_message, ai_text)
-        return ai_text
+        return ai_text, was_scheduled
 
 
 # ---------------------------------------------------------------------------
@@ -938,7 +943,7 @@ def _process(body: dict, redis_lib, psycopg2) -> None:
         http.post(
             f"{cw_url}/api/v1/accounts/{cw_account}/conversations/{conversation_id}/labels",
             headers={"api_access_token": cw_token},
-            json={"labels": ["ia_atendendo"]},
+            json={"labels": ["conversando"]},
         )
 
     # Imagens ficam com o advogado — não responder
@@ -985,11 +990,19 @@ def _process(body: dict, redis_lib, psycopg2) -> None:
     conn = psycopg2.connect(os.environ["POSTGRES_URL"])
     try:
         _init_db(conn)
-        ai_response = _call_julia(conn, session_id, all_text)
+        ai_response, was_scheduled = _call_julia(conn, session_id, all_text)
     finally:
         conn.close()
 
     _send_text(conversation_id, session_id, ai_response)
+
+    if was_scheduled:
+        with httpx.Client() as http:
+            http.post(
+                f"{cw_url}/api/v1/accounts/{cw_account}/conversations/{conversation_id}/labels",
+                headers={"api_access_token": cw_token},
+                json={"labels": ["agendado"]},
+            )
 
 
 @app.function(image=image, secrets=secrets)

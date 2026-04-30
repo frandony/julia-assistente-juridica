@@ -752,9 +752,14 @@ def _send_text(conversation_id: int, session_id: str, text: str) -> None:
 # Helpers: Google Calendar scheduling
 # ---------------------------------------------------------------------------
 
+def _chatwoot_user_token() -> str:
+    """Returns user API token for admin-level Chatwoot operations."""
+    return os.environ.get("CHATWOOT_USER_TOKEN") or os.environ["CHATWOOT_TOKEN"]
+
+
 def _get_chatwoot_team_id(area: str) -> int | None:
     url = os.environ["CHATWOOT_URL"]
-    token = os.environ["CHATWOOT_TOKEN"]
+    token = _chatwoot_user_token()
     account = os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
     target = "trabalhista" if area == "trabalhista" else "previdenci"
     try:
@@ -778,7 +783,7 @@ def _get_chatwoot_team_id(area: str) -> int | None:
 
 def _get_chatwoot_agent_id(area: str) -> int | None:
     url = os.environ["CHATWOOT_URL"]
-    token = os.environ["CHATWOOT_TOKEN"]
+    token = _chatwoot_user_token()
     account = os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
     target = "rodolfo" if area == "trabalhista" else "genaina"
     try:
@@ -814,7 +819,8 @@ def _transfer_to_lawyer(
     documents_requested: str = "",
 ) -> dict:
     url = os.environ["CHATWOOT_URL"]
-    token = os.environ["CHATWOOT_TOKEN"]
+    bot_token = os.environ["CHATWOOT_TOKEN"]
+    user_token = _chatwoot_user_token()
     account = os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
     lawyer = "Dr. Rodolfo Amadeo" if area == "trabalhista" else "Dra. Genaina Vasconcellos"
     lawyer_wa = "+55 27 98118-8433" if area == "trabalhista" else "+55 27 99953-6986"
@@ -845,7 +851,7 @@ def _transfer_to_lawyer(
             if team_id:
                 r = http.patch(
                     f"{url}/api/v1/accounts/{account}/conversations/{conversation_id}",
-                    headers={"api_access_token": token, "Content-Type": "application/json"},
+                    headers={"api_access_token": user_token, "Content-Type": "application/json"},
                     json={"team_id": team_id},
                     timeout=10,
                 )
@@ -854,7 +860,7 @@ def _transfer_to_lawyer(
             if agent_id:
                 r = http.post(
                     f"{url}/api/v1/accounts/{account}/conversations/{conversation_id}/assignments",
-                    headers={"api_access_token": token, "Content-Type": "application/json"},
+                    headers={"api_access_token": user_token, "Content-Type": "application/json"},
                     json={"assignee_id": agent_id},
                     timeout=10,
                 )
@@ -863,7 +869,7 @@ def _transfer_to_lawyer(
 
             http.post(
                 f"{url}/api/v1/accounts/{account}/conversations/{conversation_id}/messages",
-                headers={"api_access_token": token, "Content-Type": "application/json"},
+                headers={"api_access_token": bot_token, "Content-Type": "application/json"},
                 json={
                     "content": note,
                     "message_type": "outgoing",

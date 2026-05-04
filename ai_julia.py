@@ -3,8 +3,9 @@ import os
 import json
 import time
 import base64
+import re
 import httpx
-from datetime import datetime, timezone, timedelta
+from typing import Any
 
 app = modal.App("ai-julia")
 
@@ -16,27 +17,63 @@ image = (
         "anthropic",
         "redis",
         "psycopg2-binary",
-        "google-auth",
-        "google-auth-httplib2",
-        "google-api-python-client",
         "groq",
     ])
 )
 
-secrets = [modal.Secret.from_name("marina-secrets"), modal.Secret.from_name("google-calendar-secrets"), modal.Secret.from_name("groq-secrets")]
+secrets = [modal.Secret.from_name("marina-secrets"), modal.Secret.from_name("groq-secrets")]
 
 CLAUDE_MODEL = "claude-haiku-4-5"
 
+# Limites e timeouts
+CLAUDE_MAX_TOKENS = 800
+MEDIA_MAX_TOKENS = 1024
+HTTP_TIMEOUT = 10
+FETCH_TIMEOUT = 30
+
+# Debounce / polling
+IMAGE_DEBOUNCE_SEC = 10
+IMAGE_POLL_SEC = 2
+TEXT_DEBOUNCE_SEC = 3
+TEXT_POLL_SEC = 0.5
+MESSAGE_SEND_GAP_SEC = 3
+
+# Redis TTLs
+REDIS_QUEUE_TTL = 300
+REDIS_DEDUP_TTL = 60
+REDIS_LAST_MARKER_TTL = 30
+
+# Histórico
+CHAT_HISTORY_LIMIT = 20
+
 SET_LABEL_TOOL = {
     "name": "set_label",
-    "description": "Define a etiqueta da conversa no Chatwoot para indicar o estágio atual do atendimento. Chame conforme o progresso da conversa.",
+    "description": "Define a etiqueta da conversa no Chatwoot para indicar o estágio atual do atendimento. Aplique apenas uma etiqueta por vez, sempre substituindo a anterior.",
     "input_schema": {
         "type": "object",
         "properties": {
             "label": {
                 "type": "string",
-                "enum": ["conversando", "investigação", "implicação"],
-                "description": "conversando: início de qualquer resposta (setar sempre na primeira mensagem). investigação: fase de coleta SPIN. implicação: cliente qualificado, antes da transferência.",
+                "enum": [
+                    "conversando",
+                    "investigação",
+                    "implicação",
+                    "transferido",
+                    "fantasma",
+                    "retomarcontato",
+                    "dúvidaprev",
+                    "outrosassuntos",
+                ],
+                "description": (
+                    "conversando: primeira resposta da conversa ou retomada após silêncio. "
+                    "investigação: fase de coleta SPIN (Situação/Problema). "
+                    "implicação: cliente qualificado, antes da transferência. "
+                    "transferido: aplicada após transfer_to_lawyer bem-sucedido (definitiva). "
+                    "fantasma: cliente sem resposta há 24h. "
+                    "retomarcontato: cliente pediu para ser contatado em outro momento. "
+                    "dúvidaprev: dúvida pontual previdenciária sem interesse em agendar. "
+                    "outrosassuntos: assunto fora do escopo (Trabalhista/Previdenciário)."
+                ),
             }
         },
         "required": ["label"],
@@ -76,6 +113,18 @@ Nunca mencione WhatsApp, telefone ou diga que alguém vai entrar em contato — 
 # REGRA ABSOLUTA — ADVOGADO CONSTITUÍDO
 
 Se o cliente informar, em qualquer momento da conversa, que já possui advogado constituído para a questão em pauta: PARE IMEDIATAMENTE. Não faça mais nenhuma pergunta. Não explore outras áreas. Não ofereça análise complementar. Não tente captar por outro ângulo. Responda apenas com a mensagem de encerramento ético e encerre. Nenhuma exceção.
+
+# REGRA ABSOLUTA — NÚMERO DE TESTE
+
+O número +55 27 99828-8070 é utilizado exclusivamente para testes internos do escritório.
+
+Ao identificar esse número:
+- Aplique a etiqueta "conversando" normalmente na primeira resposta
+- Não aplique nenhuma outra etiqueta ao longo da conversa
+- Não execute transfer_to_lawyer em nenhuma hipótese
+- Não encerre com aviso legal
+- Prossiga o atendimento normalmente como se fosse um cliente real — o objetivo é simular o fluxo completo
+- Nunca mencione ao interlocutor que se trata de um número de teste
 
 # FORMATO — REGRA ABSOLUTA
 
@@ -354,16 +403,6 @@ Dr. Rodolfo Amadeo
 - WhatsApp: +55 27 98118-8433
 - E-mail: rodolfo@vasconcellosamadeoadvocacia.com
 
-# ETIQUETAS — COMO USAR
-
-Use a ferramenta set_label para atualizar a etiqueta da conversa conforme o estágio do atendimento:
-
-- **conversando**: acione na sua primeira resposta de qualquer conversa e sempre que retomar o diálogo normal
-- **investigação**: acione ao iniciar as perguntas SPIN de Situação e Problema — quando estiver coletando informações do caso (vínculo empregatício, situação com INSS, documentos, tempo de contribuição etc.)
-- **implicação**: acione quando o cliente já estiver qualificado e você estiver na fase de Desejo (AIDA) — destacando o valor do atendimento especializado, logo antes de usar transfer_to_lawyer
-
-Não use set_label para "agendado" — esse é definido automaticamente após transfer_to_lawyer bem-sucedido.
-
 # ÉTICA OAB — INTERNALIZADA, NÃO DECORADA
 
 As regras abaixo não são decorativas. São limites que não podem ser ultrapassados em nenhuma circunstância, independentemente do contexto ou da insistência do cliente.
@@ -371,8 +410,7 @@ As regras abaixo não são decorativas. São limites que não podem ser ultrapas
 - Nunca promete resultado, vantagem ou garantia de êxito
 - Nunca faz captação apelativa, emocional ou baseada em urgência artificial
 - Nunca usa o sofrimento ou a vulnerabilidade do cliente como argumento persuasivo
-- Sempre verifica se o cliente possui advogado constituído antes de qualquer orientação de mérito
-- Se o cliente confirmar que já possui advogado constituído — independentemente da área ou do benefício mencionado — encerre imediatamente o atendimento, sem fazer novas perguntas, sem explorar outras áreas, sem abrir frentes alternativas. O encerramento é respeitoso, definitivo e sem tentativa de captação.
+- Sempre verifica se o cliente possui advogado constituído antes de qualquer orientação de mérito (encerramento conforme regra absoluta no topo)
 - Fora das áreas do escritório (Trabalhista e Previdenciário): oriente onde buscar ajuda, sem emitir opinião de mérito
 - Encerre todo atendimento com aviso legal de forma natural e não burocrática
 
@@ -442,13 +480,9 @@ Se a pessoa não for um cliente buscando atendimento jurídico (ex: vendedor, pa
 # NOTES
 
 - Nunca prometa resultados ou vantagens
-- Nunca faça mais de uma pergunta por mensagem
-- Máximo de 2 frases por mensagem — seja direta, nunca explique o que vai fazer, apenas faça
 - Nunca use listas ou bullets nas respostas — sempre prosa. Exceção única: ao solicitar documentos após a transferência, use lista simples com hífen para facilitar a leitura do cliente
-- Nunca continue o atendimento após o cliente informar que já possui advogado — não explore outras áreas, outros benefícios nem outras questões. O encerramento é imediato e definitivo nessa conversa.
 - Nunca trate assuntos fora de Trabalhista e Previdenciário
 - Nunca repita pergunta ou informação já respondida na mesma conversa — releia o histórico completo antes de cada pergunta. Se a informação foi dada de forma indireta (ex: cliente falou "ainda estou lá" = não foi demitido; "tenho carteira" = vínculo formal), registre e não pergunte de novo
-- Nunca envie resposta com parágrafo duplo (\n\n) — escreva sempre em bloco único contínuo
 - Nunca sugira caminhos alternativos como sindicato ou empresa — seu papel é qualificar e encaminhar, não orientar
 - Nunca use jargão jurídico sem explicar em seguida
 - Nunca interprete mensagens curtas como erro de conexão — "oi", "oie", "olá" são aberturas normais
@@ -465,16 +499,89 @@ Se a pessoa não for um cliente buscando atendimento jurídico (ex: vendedor, pa
 - Após a transferência confirmada, solicitar os documentos relevantes para o caso antes de encerrar a conversa
 - Alertar sobre prazo prescricional de 2 anos em casos trabalhistas quando relevante, sem alarmismo
 - Quando o cliente estiver qualificado (nome completo, área e subárea confirmados), use transfer_to_lawyer — não pergunte data, horário ou formato de reunião
-- Use set_label durante a conversa: "conversando" na primeira resposta, "investigação" na fase de coleta SPIN, "implicação" na fase de desejo antes da transferência
 - Após a transferência, diga apenas que está transferindo e inclua o aviso legal — não mencione WhatsApp nem números de contato
-- Se a transferência falhar, informe que alguém do escritório entrará em contato em breve"""
+- Se a transferência falhar, informe que alguém do escritório entrará em contato em breve
+
+# ETIQUETAS — REGRAS COMPLETAS
+
+Use a ferramenta set_label para atualizar a etiqueta da conversa conforme o estágio. Aplique apenas uma etiqueta por vez, sempre substituindo a anterior.
+
+## Mapa completo de etiquetas
+
+- **conversando**: acione na sua primeira resposta de qualquer conversa e sempre que retomar o diálogo ativo após silêncio do cliente
+- **investigação**: acione ao iniciar as perguntas SPIN (Situação e Problema) — quando estiver coletando informações do caso
+- **implicação**: acione quando o cliente estiver qualificado e você estiver na fase de Desejo (AIDA), logo antes de usar transfer_to_lawyer
+- **transferido**: acione imediatamente após transfer_to_lawyer bem-sucedido — substitui "implicação". Nunca use "agendado".
+- **fantasma**: acione quando o cliente ficar 24 horas sem responder, independentemente do estágio em que a conversa estava
+- **retomarcontato**: acione quando o cliente pedir explicitamente para ser contatado em outro momento. Após aplicar a etiqueta, encerre a conversa com cortesia e aviso legal
+- **dúvidaprev**: acione quando o cliente apresentar apenas uma dúvida previdenciária pontual e não demonstrar interesse em agendar consulta nem se qualificar para atendimento. Após aplicar, encerre com respeito e orientação de onde buscar ajuda
+- **outrosassuntos**: acione quando o assunto for fora do escopo do escritório — propostas comerciais, marketing, divórcio, criminal, ou qualquer tema não relacionado ao Direito Trabalhista ou Previdenciário. Após aplicar, redirecione para o canal correto e encerre
+
+## Regras gerais de etiquetas
+
+- Nunca aplique mais de uma etiqueta simultaneamente
+- Sempre substitua a etiqueta anterior pela nova ao avançar de estágio
+- Nunca deixe a etiqueta "conversando" ativa após iniciar a coleta SPIN — substitua por "investigação"
+- A etiqueta "transferido" é definitiva na conversa — não aplique nenhuma outra após ela
+- A etiqueta "fantasma" não impede a retomada: se o cliente responder após 24h, aplique "conversando" novamente e retome o histórico normalmente
+
+# RETOMADA APÓS SILÊNCIO DO CLIENTE
+
+Quando um cliente retornar após período de inatividade (independentemente do tempo):
+- Releia o histórico completo da conversa antes de responder
+- Retome de onde parou, sem repetir perguntas já respondidas
+- Aplique a etiqueta "conversando" na primeira resposta de retomada
+- Continue o fluxo SPIN a partir do ponto em que foi interrompido
+
+**Exceção:** O número +55 27 99828-8070 (número de teste) não tem histórico a ser relido — trate cada sessão como nova, independentemente de conversas anteriores.
+
+# FLUXO DE ENCAMINHAMENTO POR EQUIPE
+
+A classificação da área determina para qual equipe a conversa é transferida via transfer_to_lawyer:
+
+- Caso **Trabalhista** → transferir para a equipe **Trabalhista** (Dr. Rodolfo Amadeo)
+- Caso **Previdenciário** → transferir para a equipe **Previdenciário** (Dra. Genaina Vasconcellos)
+
+Nunca transfira sem ter identificado claramente a área. Em caso de dúvida entre as duas áreas, pergunte ao cliente antes de encaminhar.
+
+Após a transferência bem-sucedida:
+1. Acione a etiqueta "transferido" via set_label
+2. Envie a mensagem de encerramento com aviso legal
+3. Não mencione WhatsApp, telefone ou forma de contato — o Chatwoot faz o redirecionamento
+
+# EXEMPLOS DE USO DAS NOVAS ETIQUETAS
+
+## retomarcontato
+> Cliente: "Agora não posso falar, me liga depois"
+> Júlia: "Sem problema. Vou registrar aqui para o escritório entrar em contato com o senhor em breve. Só lembrando que nossa conversa tem caráter informativo e não estabelece uma relação advocatícia formal."
+> [set_label: retomarcontato] → encerrar
+
+## dúvidaprev
+> Cliente tira dúvida pontual sobre carência do INSS, agradece e não demonstra interesse em agendar
+> Júlia: "Fico à disposição. Qualquer dúvida futura, estaremos aqui. Nossa conversa tem caráter informativo e não estabelece uma relação advocatícia formal."
+> [set_label: dúvidaprev] → encerrar
+
+## outrosassuntos
+> Cliente oferece serviço de marketing digital ou pergunta sobre divórcio
+> Júlia: "Esse canal é exclusivo para atendimento a clientes nas áreas Trabalhista e Previdenciária. Para outros assuntos, entre em contato diretamente com o escritório pelo WhatsApp: +55 27 99953-6986."
+> [set_label: outrosassuntos] → encerrar
+
+## fantasma
+> Cliente não responde há 24 horas
+> [set_label: fantasma] — sem enviar mensagem adicional ao cliente
+
+## transferido
+> Transferência executada com sucesso via transfer_to_lawyer
+> [set_label: transferido]
+> Júlia: "Estou transferindo você para o Dr. Rodolfo agora. Nossa conversa tem caráter informativo e não estabelece uma relação advocatícia formal."
+"""
 
 
 # ---------------------------------------------------------------------------
 # Helpers: PostgreSQL conversation memory
 # ---------------------------------------------------------------------------
 
-def _init_db(conn) -> None:
+def _init_db(conn: Any) -> None:
     cur = conn.cursor()
     cur.execute("""
         CREATE TABLE IF NOT EXISTS julia_chat_histories (
@@ -489,7 +596,7 @@ def _init_db(conn) -> None:
     cur.close()
 
 
-def _get_chat_history(conn, session_id: str, limit: int = 20) -> list:
+def _get_chat_history(conn: Any, session_id: str, limit: int = CHAT_HISTORY_LIMIT) -> list[dict[str, str]]:
     cur = conn.cursor()
     cur.execute(
         """
@@ -509,7 +616,7 @@ def _get_chat_history(conn, session_id: str, limit: int = 20) -> list:
     return [{"role": r[0], "content": r[1]} for r in rows]
 
 
-def _save_turn(conn, session_id: str, user_msg: str, assistant_msg: str) -> None:
+def _save_turn(conn: Any, session_id: str, user_msg: str, assistant_msg: str) -> None:
     cur = conn.cursor()
     cur.executemany(
         "INSERT INTO julia_chat_histories (session_id, role, content) VALUES (%s, %s, %s)",
@@ -523,9 +630,10 @@ def _save_turn(conn, session_id: str, user_msg: str, assistant_msg: str) -> None
 # Helpers: media extraction via Claude Vision / Document
 # ---------------------------------------------------------------------------
 
-def _fetch(url: str) -> tuple:
+def _fetch(url: str) -> tuple[bytes, str]:
     """Download URL → (bytes, content_type)."""
-    r = httpx.get(url, follow_redirects=True, timeout=30)
+    r = httpx.get(url, follow_redirects=True, timeout=FETCH_TIMEOUT)
+    r.raise_for_status()
     ct = r.headers.get("content-type", "application/octet-stream").split(";")[0].strip()
     return r.content, ct
 
@@ -536,60 +644,47 @@ def _normalize_image_mime(mime: str) -> str:
     return aliases.get(mime, mime) if aliases.get(mime, mime) in supported else "image/jpeg"
 
 
-def _claude_analyze_image(data: bytes, mime_type: str) -> str:
+def _claude_extract_media(data: bytes, source_type: str, media_type: str, prompt_text: str) -> str:
     import anthropic
 
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
     resp = client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=1024,
+        max_tokens=MEDIA_MAX_TOKENS,
         messages=[{
             "role": "user",
             "content": [
                 {
-                    "type": "image",
+                    "type": source_type,
                     "source": {
                         "type": "base64",
-                        "media_type": _normalize_image_mime(mime_type),
+                        "media_type": media_type,
                         "data": base64.b64encode(data).decode(),
                     },
                 },
-                {
-                    "type": "text",
-                    "text": "Extraia o conteúdo da imagem e retorne em formato de texto sem caracteres especiais.",
-                },
+                {"type": "text", "text": prompt_text},
             ],
         }],
     )
     return next(b.text for b in resp.content if b.type == "text")
+
+
+def _claude_analyze_image(data: bytes, mime_type: str) -> str:
+    return _claude_extract_media(
+        data,
+        source_type="image",
+        media_type=_normalize_image_mime(mime_type),
+        prompt_text="Extraia o conteúdo da imagem e retorne em formato de texto sem caracteres especiais.",
+    )
 
 
 def _claude_analyze_document(data: bytes) -> str:
-    import anthropic
-
-    client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    resp = client.messages.create(
-        model=CLAUDE_MODEL,
-        max_tokens=1024,
-        messages=[{
-            "role": "user",
-            "content": [
-                {
-                    "type": "document",
-                    "source": {
-                        "type": "base64",
-                        "media_type": "application/pdf",
-                        "data": base64.b64encode(data).decode(),
-                    },
-                },
-                {
-                    "type": "text",
-                    "text": "Extraia o conteúdo do documento e retorne em formato de texto sem caracteres especiais.",
-                },
-            ],
-        }],
+    return _claude_extract_media(
+        data,
+        source_type="document",
+        media_type="application/pdf",
+        prompt_text="Extraia o conteúdo do documento e retorne em formato de texto sem caracteres especiais.",
     )
-    return next(b.text for b in resp.content if b.type == "text")
 
 
 def _transcribe_audio(data: bytes, mime_type: str) -> str:
@@ -631,10 +726,73 @@ def _extract_text(file_type: str, content: str, data_url: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Helpers: Chatwoot HTTP primitives
+# ---------------------------------------------------------------------------
+
+def _chatwoot_env() -> tuple[str, str, str]:
+    """Returns (base_url, bot_token, account_id)."""
+    return (
+        os.environ["CHATWOOT_URL"],
+        os.environ["CHATWOOT_TOKEN"],
+        os.environ.get("CHATWOOT_ACCOUNT_ID", "1"),
+    )
+
+
+def _chatwoot_set_labels(conversation_id: int, labels: list[str]) -> None:
+    url, token, account = _chatwoot_env()
+    with httpx.Client() as http:
+        http.post(
+            f"{url}/api/v1/accounts/{account}/conversations/{conversation_id}/labels",
+            headers={"api_access_token": token, "Content-Type": "application/json"},
+            json={"labels": labels},
+            timeout=HTTP_TIMEOUT,
+        )
+
+
+def _chatwoot_open_conversation(conversation_id: int) -> None:
+    url, token, account = _chatwoot_env()
+    with httpx.Client() as http:
+        http.post(
+            f"{url}/api/v1/accounts/{account}/conversations/{conversation_id}/toggle_status",
+            headers={"api_access_token": token},
+            json={"status": "open"},
+        )
+
+
+def _chatwoot_post_message(
+    conversation_id: int,
+    content: str,
+    *,
+    private: bool = False,
+    source_id: str | None = None,
+    token: str | None = None,
+) -> None:
+    url, default_token, account = _chatwoot_env()
+    payload: dict[str, Any] = {
+        "content": content,
+        "message_type": "outgoing",
+        "content_type": "text",
+        "private": private,
+    }
+    if source_id is not None:
+        payload["content_attributes"] = {"source_id": source_id}
+    with httpx.Client() as http:
+        r = http.post(
+            f"{url}/api/v1/accounts/{account}/conversations/{conversation_id}/messages",
+            headers={"api_access_token": token or default_token, "Content-Type": "application/json"},
+            json=payload,
+            timeout=HTTP_TIMEOUT,
+        )
+        if r.status_code >= 400:
+            print(f"[chatwoot:post_message_error] status={r.status_code} body={r.text[:500]!r}")
+            r.raise_for_status()
+
+
+# ---------------------------------------------------------------------------
 # Helpers: AI agent (Júlia via Anthropic SDK with prompt caching)
 # ---------------------------------------------------------------------------
 
-def _call_julia(conn, session_id: str, user_message: str, conversation_id: int) -> tuple:
+def _call_julia(conn: Any, session_id: str, user_message: str, conversation_id: int) -> tuple[str, bool]:
     import anthropic
 
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -643,21 +801,6 @@ def _call_julia(conn, session_id: str, user_message: str, conversation_id: int) 
     messages = list(history)
     messages.append({"role": "user", "content": user_message})
 
-    _days_pt = ["segunda-feira", "terça-feira", "quarta-feira", "quinta-feira", "sexta-feira", "sábado", "domingo"]
-    _months_pt = ["janeiro", "fevereiro", "março", "abril", "maio", "junho", "julho", "agosto", "setembro", "outubro", "novembro", "dezembro"]
-    _now = datetime.now(timezone(timedelta(hours=-3)))
-    today = f"{_days_pt[_now.weekday()]}, {_now.day} de {_months_pt[_now.month-1]} de {_now.year}"
-    today_iso = _now.strftime("%Y-%m-%d")
-
-    # For each weekday, find the next occurrence (strictly after today)
-    next_occurrences = []
-    for day_idx, day_name in enumerate(_days_pt):
-        days_ahead = (day_idx - _now.weekday()) % 7
-        if days_ahead == 0:
-            days_ahead = 7  # same weekday = next week
-        d = _now + timedelta(days=days_ahead)
-        next_occurrences.append(f"  Próxima {day_name}: {d.strftime('%d/%m/%Y')}")
-    next_days = "\n".join(next_occurrences)
     system = [
         {
             "type": "text",
@@ -682,7 +825,7 @@ def _call_julia(conn, session_id: str, user_message: str, conversation_id: int) 
     while True:
         resp = client.messages.create(
             model=CLAUDE_MODEL,
-            max_tokens=800,
+            max_tokens=CLAUDE_MAX_TOKENS,
             system=system,
             tools=[SET_LABEL_TOOL, TRANSFER_TO_LAWYER_TOOL],
             messages=messages,
@@ -692,10 +835,6 @@ def _call_julia(conn, session_id: str, user_message: str, conversation_id: int) 
         text_block = next((b for b in resp.content if b.type == "text"), None)
 
         if tool_blocks:
-            cw_url = os.environ["CHATWOOT_URL"]
-            cw_token = os.environ["CHATWOOT_TOKEN"]
-            cw_account = os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
-
             tool_results = []
             for tool_block in tool_blocks:
                 tool_name = tool_block.name
@@ -704,13 +843,7 @@ def _call_julia(conn, session_id: str, user_message: str, conversation_id: int) 
                 if tool_name == "set_label":
                     label = args.get("label", "")
                     try:
-                        with httpx.Client() as http:
-                            http.post(
-                                f"{cw_url}/api/v1/accounts/{cw_account}/conversations/{conversation_id}/labels",
-                                headers={"api_access_token": cw_token, "Content-Type": "application/json"},
-                                json={"labels": [label]},
-                                timeout=10,
-                            )
+                        _chatwoot_set_labels(conversation_id, [label])
                         result = {"success": True, "label": label}
                     except Exception as e:
                         result = {"success": False, "error": str(e)}
@@ -754,33 +887,60 @@ def _call_julia(conn, session_id: str, user_message: str, conversation_id: int) 
 # Helpers: send responses back to Chatwoot
 # ---------------------------------------------------------------------------
 
+_MARKDOWN_BOLD_RE = re.compile(r"\*\*(.+?)\*\*")
+_MARKDOWN_ITALIC_RE = re.compile(r"\*(.+?)\*")
+
+
+def _strip_markdown(text: str) -> str:
+    """Remove apenas padrões markdown bold/italic, preservando asteriscos isolados."""
+    text = _MARKDOWN_BOLD_RE.sub(r"\1", text)
+    text = _MARKDOWN_ITALIC_RE.sub(r"\1", text)
+    return text
+
+
 def _send_text(conversation_id: int, session_id: str, text: str) -> None:
-    url = os.environ["CHATWOOT_URL"]
-    token = os.environ["CHATWOOT_TOKEN"]
-    account = os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
+    cleaned = _strip_markdown(text)
+    parts = [p.strip() for p in cleaned.split("\n\n") if p.strip()]
 
-    # Strip markdown bold, split on blank lines, 3 s gap between parts (mirrors n8n)
-    parts = [p.strip() for p in text.replace("*", "").split("\n\n") if p.strip()]
+    for i, part in enumerate(parts):
+        if i > 0:
+            time.sleep(MESSAGE_SEND_GAP_SEC)
+        _chatwoot_post_message(conversation_id, part, source_id=session_id)
 
-    with httpx.Client() as http:
-        for i, part in enumerate(parts):
-            if i > 0:
-                time.sleep(3)
-            http.post(
-                f"{url}/api/v1/accounts/{account}/conversations/{conversation_id}/messages",
-                headers={"Content-Type": "application/json", "api_access_token": token},
-                json={
-                    "content": part,
-                    "message_type": "outgoing",
-                    "content_type": "text",
-                    "private": False,
-                    "content_attributes": {"source_id": session_id},
-                },
-            )
+
+def _debug_skip(reason: str, **details: Any) -> None:
+    printable = " ".join(f"{key}={value!r}" for key, value in details.items())
+    print(f"[webhook:skip] {reason} {printable}".strip())
+
+
+def _message_id(body: dict[str, Any]) -> str:
+    """Return a per-message id. Chatwoot source_id can be a stable contact id."""
+    candidates = (
+        body.get("id"),
+        body.get("message_id"),
+        body.get("uuid"),
+        body.get("source_id"),
+    )
+    for candidate in candidates:
+        if candidate is not None and str(candidate).strip():
+            return str(candidate)
+
+    conversation = body.get("conversation") or {}
+    return f"{conversation.get('id', 'unknown')}:{time.time_ns()}"
+
+
+def _attachment_url(attachment: dict[str, Any]) -> str:
+    return (
+        attachment.get("data_url")
+        or attachment.get("download_url")
+        or attachment.get("file_url")
+        or attachment.get("url")
+        or ""
+    )
 
 
 # ---------------------------------------------------------------------------
-# Helpers: Google Calendar scheduling
+# Helpers: Chatwoot transfer & lookup
 # ---------------------------------------------------------------------------
 
 def _chatwoot_user_token() -> str:
@@ -788,53 +948,76 @@ def _chatwoot_user_token() -> str:
     return os.environ.get("CHATWOOT_USER_TOKEN") or os.environ["CHATWOOT_TOKEN"]
 
 
-def _get_chatwoot_team_id(area: str) -> int | None:
+_AREA_TEAM_TARGETS = {"trabalhista": "trabalhista", "previdenciario": "previdenci"}
+_AREA_AGENT_TARGETS = {"trabalhista": "rodolfo", "previdenciario": "genaina"}
+_AREA_LAWYERS = {
+    "trabalhista": ("Dr. Rodolfo Amadeo", "+55 27 98118-8433", "Trabalhista"),
+    "previdenciario": ("Dra. Genaina Vasconcellos", "+55 27 99953-6986", "Previdenciário"),
+}
+
+
+def _chatwoot_lookup(endpoint: str, target_substring: str, log_label: str) -> int | None:
     url = os.environ["CHATWOOT_URL"]
     token = _chatwoot_user_token()
     account = os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
-    target = "trabalhista" if area == "trabalhista" else "previdenci"
     try:
         with httpx.Client() as http:
             resp = http.get(
-                f"{url}/api/v1/accounts/{account}/teams",
+                f"{url}/api/v1/accounts/{account}/{endpoint}",
                 headers={"api_access_token": token},
-                timeout=10,
+                timeout=HTTP_TIMEOUT,
             )
             data = resp.json()
-            print(f"[teams API] status={resp.status_code} data={str(data)[:300]}")
+            print(f"[{log_label} API] status={resp.status_code} data={str(data)[:300]}")
             if isinstance(data, dict):
                 data = data.get("payload", [])
-            for team in data:
-                if target.lower() in team.get("name", "").lower():
-                    return team["id"]
+            target = target_substring.lower()
+            for item in data:
+                if target in (item.get("name", "") or "").lower():
+                    return item["id"]
     except Exception as e:
-        print(f"[teams API error] {e}")
+        print(f"[{log_label} API error] {e}")
     return None
+
+
+def _get_chatwoot_team_id(area: str) -> int | None:
+    target = _AREA_TEAM_TARGETS.get(area, _AREA_TEAM_TARGETS["previdenciario"])
+    return _chatwoot_lookup("teams", target, "teams")
 
 
 def _get_chatwoot_agent_id(area: str) -> int | None:
-    url = os.environ["CHATWOOT_URL"]
-    token = _chatwoot_user_token()
-    account = os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
-    target = "rodolfo" if area == "trabalhista" else "genaina"
-    try:
-        with httpx.Client() as http:
-            resp = http.get(
-                f"{url}/api/v1/accounts/{account}/agents",
-                headers={"api_access_token": token},
-                timeout=10,
-            )
-            data = resp.json()
-            print(f"[agents API] status={resp.status_code} data={str(data)[:300]}")
-            if isinstance(data, dict):
-                data = data.get("payload", [])
-            for agent in data:
-                name = agent.get("name", "").lower()
-                if target in name:
-                    return agent["id"]
-    except Exception as e:
-        print(f"[agents API error] {e}")
-    return None
+    target = _AREA_AGENT_TARGETS.get(area, _AREA_AGENT_TARGETS["previdenciario"])
+    return _chatwoot_lookup("agents", target, "agents")
+
+
+def _build_transfer_note(
+    *,
+    client_name: str,
+    client_whatsapp: str,
+    client_email: str,
+    client_city: str,
+    area_label: str,
+    subarea: str,
+    case_summary: str,
+    qualification_notes: str,
+    documents_requested: str,
+    lawyer: str,
+    lawyer_wa: str,
+) -> str:
+    email_line = f"\n- E-mail: {client_email}" if client_email else ""
+    city_line = f"\n- Cidade/Estado: {client_city}" if client_city else ""
+    docs_line = documents_requested if documents_requested else "Não informado"
+    return (
+        f"📋 RESUMO DO ATENDIMENTO — Júlia (Assistente Virtual)\n\n"
+        f"👤 Cliente: {client_name}\n"
+        f"- WhatsApp: {client_whatsapp}{email_line}{city_line}\n\n"
+        f"⚖️ Área: {area_label} — {subarea}\n\n"
+        f"📝 Resumo do caso:\n{case_summary}\n\n"
+        f"✅ Qualificação:\n{qualification_notes}\n\n"
+        f"📎 Documentos solicitados: {docs_line}\n\n"
+        f"👨‍⚖️ Responsável: {lawyer} ({lawyer_wa})\n"
+        f"📌 Canal: WhatsApp"
+    )
 
 
 def _transfer_to_lawyer(
@@ -848,43 +1031,38 @@ def _transfer_to_lawyer(
     client_email: str = "",
     client_city: str = "",
     documents_requested: str = "",
-) -> dict:
+) -> dict[str, Any]:
     url = os.environ["CHATWOOT_URL"]
-    bot_token = os.environ["CHATWOOT_TOKEN"]
     user_token = _chatwoot_user_token()
     account = os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
-    lawyer = "Dr. Rodolfo Amadeo" if area == "trabalhista" else "Dra. Genaina Vasconcellos"
-    lawyer_wa = "+55 27 98118-8433" if area == "trabalhista" else "+55 27 99953-6986"
-    area_label = "Trabalhista" if area == "trabalhista" else "Previdenciário"
+    lawyer, lawyer_wa, area_label = _AREA_LAWYERS.get(area, _AREA_LAWYERS["previdenciario"])
 
     try:
         team_id = _get_chatwoot_team_id(area)
         agent_id = _get_chatwoot_agent_id(area)
 
-        email_line = f"\n- E-mail: {client_email}" if client_email else ""
-        city_line = f"\n- Cidade/Estado: {client_city}" if client_city else ""
-        docs_line = documents_requested if documents_requested else "Não informado"
-
-        note = (
-            f"📋 RESUMO DO ATENDIMENTO — Júlia (Assistente Virtual)\n\n"
-            f"👤 Cliente: {client_name}\n"
-            f"- WhatsApp: {client_whatsapp}{email_line}{city_line}\n\n"
-            f"⚖️ Área: {area_label} — {subarea}\n\n"
-            f"📝 Resumo do caso:\n{case_summary}\n\n"
-            f"✅ Qualificação:\n{qualification_notes}\n\n"
-            f"📎 Documentos solicitados: {docs_line}\n\n"
-            f"👨‍⚖️ Responsável: {lawyer} ({lawyer_wa})\n"
-            f"📌 Canal: WhatsApp"
+        note = _build_transfer_note(
+            client_name=client_name,
+            client_whatsapp=client_whatsapp,
+            client_email=client_email,
+            client_city=client_city,
+            area_label=area_label,
+            subarea=subarea,
+            case_summary=case_summary,
+            qualification_notes=qualification_notes,
+            documents_requested=documents_requested,
+            lawyer=lawyer,
+            lawyer_wa=lawyer_wa,
         )
 
-        assign_errors = []
+        assign_errors: list[str] = []
         with httpx.Client() as http:
             if team_id:
                 r = http.patch(
                     f"{url}/api/v1/accounts/{account}/conversations/{conversation_id}",
                     headers={"api_access_token": user_token, "Content-Type": "application/json"},
                     json={"team_id": team_id},
-                    timeout=10,
+                    timeout=HTTP_TIMEOUT,
                 )
                 if r.status_code >= 400:
                     assign_errors.append(f"team PATCH {r.status_code}: {r.text[:200]}")
@@ -893,28 +1071,74 @@ def _transfer_to_lawyer(
                     f"{url}/api/v1/accounts/{account}/conversations/{conversation_id}/assignments",
                     headers={"api_access_token": user_token, "Content-Type": "application/json"},
                     json={"assignee_id": agent_id},
-                    timeout=10,
+                    timeout=HTTP_TIMEOUT,
                 )
                 if r.status_code >= 400:
                     assign_errors.append(f"agent POST {r.status_code}: {r.text[:200]}")
 
-            http.post(
-                f"{url}/api/v1/accounts/{account}/conversations/{conversation_id}/messages",
-                headers={"api_access_token": bot_token, "Content-Type": "application/json"},
-                json={
-                    "content": note,
-                    "message_type": "outgoing",
-                    "content_type": "text",
-                    "private": True,
-                },
-                timeout=10,
-            )
+        _chatwoot_post_message(conversation_id, note, private=True)
 
         assign_info = f" | assign_errors: {assign_errors}" if assign_errors else ""
         print(f"[transfer] team_id={team_id} agent_id={agent_id}{assign_info}")
-        return {"success": True, "lawyer": lawyer, "lawyer_wa": lawyer_wa, "team_assigned": team_id is not None and not any("team" in e for e in assign_errors), "error": assign_errors or None}
+        return {
+            "success": True,
+            "lawyer": lawyer,
+            "lawyer_wa": lawyer_wa,
+            "team_assigned": team_id is not None and not any("team" in e for e in assign_errors),
+            "error": assign_errors or None,
+        }
     except Exception as e:
         return {"success": False, "lawyer": lawyer, "lawyer_wa": lawyer_wa, "team_assigned": False, "error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# Helpers: pipeline finalize + debounce primitives
+# ---------------------------------------------------------------------------
+
+def _run_julia_and_send(
+    psycopg2: Any,
+    session_id: str,
+    user_text: str,
+    conversation_id: int,
+) -> None:
+    """Abre conexão, chama Júlia, envia resposta e aplica label final se transferido."""
+    conn = psycopg2.connect(os.environ["POSTGRES_URL"])
+    try:
+        _init_db(conn)
+        ai_response, was_transferred = _call_julia(conn, session_id, user_text, conversation_id)
+    finally:
+        conn.close()
+
+    _send_text(conversation_id, session_id, ai_response)
+
+    if was_transferred:
+        _chatwoot_set_labels(conversation_id, ["transferido"])
+
+
+def _wait_for_image_silence(redis_client: Any, key: str, msg_id: str) -> bool:
+    """True quando IMAGE_DEBOUNCE_SEC se passaram desde a última imagem desta sessão."""
+    while True:
+        raw = redis_client.lrange(key, 0, -1)
+        if not raw:
+            return False
+        last = json.loads(raw[-1])
+        if last["id"] != msg_id:
+            return False  # imagem mais recente chegou — deixa ela processar
+        if time.time() - last["enqueued_at"] >= IMAGE_DEBOUNCE_SEC:
+            return True
+        time.sleep(IMAGE_POLL_SEC)
+
+
+def _wait_for_text_silence(redis_client: Any, last_key: str, msg_id: str) -> bool:
+    """True quando TEXT_DEBOUNCE_SEC se passaram sem nova mensagem da sessão."""
+    poll_start = time.time()
+    while True:
+        current_last = redis_client.get(last_key)
+        if current_last is None or current_last.decode() != msg_id:
+            return False
+        if time.time() - poll_start >= TEXT_DEBOUNCE_SEC:
+            return True
+        time.sleep(TEXT_POLL_SEC)
 
 
 # ---------------------------------------------------------------------------
@@ -929,30 +1153,40 @@ def process_message(body: dict) -> None:
 
     try:
         _process(body, redis_lib, psycopg2)
+        print("BODY:", body)
+        print("CONTENT:", body.get("content"))
+        print("ATTACHMENTS:", body.get("attachments"))
+
     except Exception:
         traceback.print_exc()
 
 
-def _process(body: dict, redis_lib, psycopg2) -> None:
+def _process(body: dict[str, Any], redis_lib: Any, psycopg2: Any) -> None:
     # Agent Bot payload: message fields are at body root level
     msg_type = body.get("message_type")
 
     # Only process incoming messages; ignore outgoing/activity to avoid infinite loops
     if msg_type not in (0, "incoming"):
+        _debug_skip("message_type", message_type=msg_type, event=body.get("event"), id=body.get("id"))
         return
 
     # Ignore messages sent by human agents or the bot itself — only process customer messages
     sender_type = (body.get("sender") or {}).get("type", "")
-    if sender_type in ("agent", "user", "agent_bot"):
+    if sender_type in ("agent_bot", "bot"):
+        _debug_skip("sender_type", sender_type=sender_type, id=body.get("id"))
         return
 
     conversation = body.get("conversation") or {}
     conversation_id = conversation.get("id")
+    if not conversation_id:
+        _debug_skip("missing_conversation_id", id=body.get("id"))
+        return
 
     # Stop only if a human explicitly added the "atendimento_humano" label
     # (avoid blocking on auto-assignment caused by the bot's own API token)
     labels = conversation.get("labels") or []
     if "atendimento_humano" in labels:
+        _debug_skip("human_label", conversation_id=conversation_id, labels=labels)
         return
 
     # session_id: prefer WhatsApp source_id, fall back to conversation id
@@ -967,48 +1201,31 @@ def _process(body: dict, redis_lib, psycopg2) -> None:
     attachments = body.get("attachments") or []
     first_att = attachments[0] if attachments else {}
     file_type = first_att.get("file_type") or ""
-    data_url = first_att.get("data_url") or ""
-    msg_id = body.get("source_id") or str(body.get("id") or "")
-    msg_timestamp = body.get("created_at") or ""
+    data_url = _attachment_url(first_att)
+    msg_id = _message_id(body)
 
     # Deduplication: ignore if this exact message was already processed
     r = redis_lib.from_url(os.environ["REDIS_URL"])
-    dedup_key = f"dedup:{msg_id}"
-    if not r.set(dedup_key, "1", nx=True, ex=60):
+    if not r.set(f"dedup:{msg_id}", "1", nx=True, ex=REDIS_DEDUP_TTL):
+        _debug_skip("duplicate", msg_id=msg_id, source_id=body.get("source_id"), id=body.get("id"))
         return  # another invocation already claimed this message
 
-    cw_url = os.environ["CHATWOOT_URL"]
-    cw_token = os.environ["CHATWOOT_TOKEN"]
-    cw_account = os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
+    _chatwoot_open_conversation(conversation_id)
 
-    with httpx.Client() as http:
-        http.post(
-            f"{cw_url}/api/v1/accounts/{cw_account}/conversations/{conversation_id}/toggle_status",
-            headers={"api_access_token": cw_token},
-            json={"status": "open"},
-        )
-
-    # --- Image debounce: coleta imagens e espera 10s desde a última ---
+    # --- Image debounce: coleta imagens e espera silêncio desde a última ---
     if file_type == "image":
         img_key = f"images:{session_id}"
         r.rpush(img_key, json.dumps({"data_url": data_url, "id": msg_id, "enqueued_at": time.time()}))
-        r.expire(img_key, 300)
+        r.expire(img_key, REDIS_QUEUE_TTL)
 
-        while True:
-            raw = r.lrange(img_key, 0, -1)
-            if not raw:
-                return
-            last = json.loads(raw[-1])
-            if last["id"] != msg_id:
-                return  # imagem mais recente chegou — deixa ela processar
-            if time.time() - last["enqueued_at"] >= 10:
-                break  # 10s de silêncio confirmado
-            time.sleep(2)
+        if not _wait_for_image_silence(r, img_key, msg_id):
+            _debug_skip("newer_image_waiting", conversation_id=conversation_id, msg_id=msg_id)
+            return
 
         all_imgs = r.lrange(img_key, 0, -1)
         r.delete(img_key)
 
-        img_texts = []
+        img_texts: list[str] = []
         for raw_img in all_imgs:
             img = json.loads(raw_img)
             if img.get("data_url"):
@@ -1017,82 +1234,44 @@ def _process(body: dict, redis_lib, psycopg2) -> None:
                     text = _claude_analyze_image(data, mime)
                     if text:
                         img_texts.append(text)
-                except Exception:
-                    pass
+                except Exception as e:
+                    print(f"[webhook:image_error] msg_id={img.get('id')!r} error={e!r}")
 
         if not img_texts:
+            _debug_skip("image_without_extracted_text", conversation_id=conversation_id, msg_id=msg_id)
             return
 
-        all_text = "\n\n".join(img_texts)
-
-        conn = psycopg2.connect(os.environ["POSTGRES_URL"])
-        try:
-            _init_db(conn)
-            ai_response, was_transferred = _call_julia(conn, session_id, all_text, conversation_id)
-        finally:
-            conn.close()
-
-        _send_text(conversation_id, session_id, ai_response)
-
-        if was_transferred:
-            with httpx.Client() as http:
-                http.post(
-                    f"{cw_url}/api/v1/accounts/{cw_account}/conversations/{conversation_id}/labels",
-                    headers={"api_access_token": cw_token},
-                    json={"labels": ["agendado"]},
-                )
+        _run_julia_and_send(psycopg2, session_id, "\n\n".join(img_texts), conversation_id)
         return
 
     text_message = _extract_text(file_type, message_content, data_url)
     if not text_message:
         if file_type == "audio":
             _send_text(conversation_id, session_id, AUDIO_MSG)
+        _debug_skip("empty_text", conversation_id=conversation_id, msg_id=msg_id, file_type=file_type, has_url=bool(data_url))
         return
 
     # --- Redis debounce: coleta mensagens rápidas e responde de uma vez ---
     last_key = f"last:{session_id}"
     r.rpush(session_id, json.dumps({"textMessage": text_message, "id": msg_id}))
-    r.expire(session_id, 300)
-    r.set(last_key, msg_id, ex=30)  # atomic "eu sou o mais recente"
+    r.expire(session_id, REDIS_QUEUE_TTL)
+    r.set(last_key, msg_id, ex=REDIS_LAST_MARKER_TTL)
 
-    poll_start = time.time()
-    while True:
-        current_last = r.get(last_key)
-        if current_last is None or current_last.decode() != msg_id:
-            return  # mensagem mais nova chegou, deixa ela processar
-
-        if time.time() - poll_start >= 3:
-            break  # 3s de silêncio confirmado
-
-        time.sleep(0.5)
+    if not _wait_for_text_silence(r, last_key, msg_id):
+        _debug_skip("newer_text_waiting", conversation_id=conversation_id, msg_id=msg_id)
+        return
 
     # Collect all queued messages and clear the queue
     all_text = "\n".join(json.loads(m)["textMessage"] for m in r.lrange(session_id, 0, -1))
     r.delete(session_id)
     r.delete(last_key)
 
-    # --- Call Claude and send response ---
-    conn = psycopg2.connect(os.environ["POSTGRES_URL"])
-    try:
-        _init_db(conn)
-        ai_response, was_transferred = _call_julia(conn, session_id, all_text, conversation_id)
-    finally:
-        conn.close()
-
-    _send_text(conversation_id, session_id, ai_response)
-
-    if was_transferred:
-        with httpx.Client() as http:
-            http.post(
-                f"{cw_url}/api/v1/accounts/{cw_account}/conversations/{conversation_id}/labels",
-                headers={"api_access_token": cw_token},
-                json={"labels": ["agendado"]},
-            )
+    _run_julia_and_send(psycopg2, session_id, all_text, conversation_id)
 
 
 @app.function(image=image, secrets=secrets)
 @modal.fastapi_endpoint(method="POST")
-async def webhook(body: dict):
+async def webhook(body: dict) -> dict[str, str]:
     """Receives Chatwoot webhook events and processes them asynchronously."""
     await process_message.spawn.aio(body)
     return {"status": "received"}

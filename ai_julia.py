@@ -4,6 +4,7 @@ import json
 import time
 import base64
 import re
+import hashlib
 import httpx
 from typing import Any
 
@@ -738,25 +739,40 @@ def _chatwoot_env() -> tuple[str, str, str]:
     )
 
 
-def _chatwoot_set_labels(conversation_id: int, labels: list[str]) -> None:
-    url, token, account = _chatwoot_env()
+def _chatwoot_set_labels(conversation_id: int, labels: list[str], account_id: str | None = None) -> None:
+    url, token, default_account = _chatwoot_env()
+    account = account_id or default_account
     with httpx.Client() as http:
-        http.post(
+        r = http.post(
             f"{url}/api/v1/accounts/{account}/conversations/{conversation_id}/labels",
             headers={"api_access_token": token, "Content-Type": "application/json"},
             json={"labels": labels},
             timeout=HTTP_TIMEOUT,
         )
+        if r.status_code >= 400:
+            print(
+                f"[chatwoot:set_labels_error] account={account!r} "
+                f"conversation_id={conversation_id!r} status={r.status_code} body={r.text[:500]!r}"
+            )
+            r.raise_for_status()
 
 
-def _chatwoot_open_conversation(conversation_id: int) -> None:
-    url, token, account = _chatwoot_env()
+def _chatwoot_open_conversation(conversation_id: int, account_id: str | None = None) -> None:
+    url, token, default_account = _chatwoot_env()
+    account = account_id or default_account
     with httpx.Client() as http:
-        http.post(
+        r = http.post(
             f"{url}/api/v1/accounts/{account}/conversations/{conversation_id}/toggle_status",
             headers={"api_access_token": token},
             json={"status": "open"},
+            timeout=HTTP_TIMEOUT,
         )
+        if r.status_code >= 400:
+            print(
+                f"[chatwoot:open_conversation_error] account={account!r} "
+                f"conversation_id={conversation_id!r} status={r.status_code} body={r.text[:500]!r}"
+            )
+            r.raise_for_status()
 
 
 def _chatwoot_post_message(
@@ -766,8 +782,10 @@ def _chatwoot_post_message(
     private: bool = False,
     source_id: str | None = None,
     token: str | None = None,
+    account_id: str | None = None,
 ) -> None:
-    url, default_token, account = _chatwoot_env()
+    url, default_token, default_account = _chatwoot_env()
+    account = account_id or default_account
     payload: dict[str, Any] = {
         "content": content,
         "message_type": "outgoing",
@@ -784,7 +802,10 @@ def _chatwoot_post_message(
             timeout=HTTP_TIMEOUT,
         )
         if r.status_code >= 400:
-            print(f"[chatwoot:post_message_error] status={r.status_code} body={r.text[:500]!r}")
+            print(
+                f"[chatwoot:post_message_error] account={account!r} "
+                f"conversation_id={conversation_id!r} status={r.status_code} body={r.text[:500]!r}"
+            )
             r.raise_for_status()
 
 
@@ -792,7 +813,13 @@ def _chatwoot_post_message(
 # Helpers: AI agent (Júlia via Anthropic SDK with prompt caching)
 # ---------------------------------------------------------------------------
 
-def _call_julia(conn: Any, session_id: str, user_message: str, conversation_id: int) -> tuple[str, bool]:
+def _call_julia(
+    conn: Any,
+    session_id: str,
+    user_message: str,
+    conversation_id: int,
+    account_id: str | None = None,
+) -> tuple[str, bool]:
     import anthropic
 
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
@@ -843,7 +870,7 @@ def _call_julia(conn: Any, session_id: str, user_message: str, conversation_id: 
                 if tool_name == "set_label":
                     label = args.get("label", "")
                     try:
-                        _chatwoot_set_labels(conversation_id, [label])
+                        _chatwoot_set_labels(conversation_id, [label], account_id=account_id)
                         result = {"success": True, "label": label}
                     except Exception as e:
                         result = {"success": False, "error": str(e)}
@@ -851,6 +878,7 @@ def _call_julia(conn: Any, session_id: str, user_message: str, conversation_id: 
                 elif tool_name == "transfer_to_lawyer":
                     result = _transfer_to_lawyer(
                         conversation_id=conversation_id,
+                        account_id=account_id,
                         area=args["area"],
                         subarea=args["subarea"],
                         client_name=args["client_name"],
@@ -898,14 +926,19 @@ def _strip_markdown(text: str) -> str:
     return text
 
 
-def _send_text(conversation_id: int, session_id: str, text: str) -> None:
+def _send_text(
+    conversation_id: int,
+    session_id: str,
+    text: str,
+    account_id: str | None = None,
+) -> None:
     cleaned = _strip_markdown(text)
     parts = [p.strip() for p in cleaned.split("\n\n") if p.strip()]
 
     for i, part in enumerate(parts):
         if i > 0:
             time.sleep(MESSAGE_SEND_GAP_SEC)
-        _chatwoot_post_message(conversation_id, part, source_id=session_id)
+        _chatwoot_post_message(conversation_id, part, source_id=session_id, account_id=account_id)
 
 
 def _debug_skip(reason: str, **details: Any) -> None:
@@ -913,20 +946,146 @@ def _debug_skip(reason: str, **details: Any) -> None:
     print(f"[webhook:skip] {reason} {printable}".strip())
 
 
-def _message_id(body: dict[str, Any]) -> str:
-    """Return a per-message id. Chatwoot source_id can be a stable contact id."""
+def _event_name(body: dict[str, Any]) -> str:
+    event = body.get("event")
+    return str(event).strip() if event is not None else ""
+
+
+def _message_payload(body: dict[str, Any]) -> dict[str, Any]:
+    message = body.get("message")
+    return message if isinstance(message, dict) else body
+
+
+def _conversation_payload(body: dict[str, Any]) -> dict[str, Any]:
+    message = _message_payload(body)
+    conversation = body.get("conversation") or message.get("conversation")
+    return conversation if isinstance(conversation, dict) else {}
+
+
+def _account_id(body: dict[str, Any]) -> str | None:
+    message = _message_payload(body)
+    account = body.get("account") or message.get("account")
+    if isinstance(account, dict) and account.get("id") is not None:
+        return str(account["id"])
+
+    for container in (body, message):
+        account_value = container.get("account_id")
+        if account_value is not None and str(account_value).strip():
+            return str(account_value).strip()
+
+    return None
+
+
+def _message_type(body: dict[str, Any]) -> Any:
+    message = _message_payload(body)
+    if body.get("message_type") is not None:
+        return body.get("message_type")
+    return message.get("message_type")
+
+
+def _sender_type(body: dict[str, Any]) -> str:
+    message = _message_payload(body)
+    for container in (body, message):
+        sender = container.get("sender")
+        if isinstance(sender, dict) and sender.get("type") is not None:
+            return str(sender["type"]).strip().lower()
+    return ""
+
+
+def _message_content(body: dict[str, Any]) -> str:
+    message = _message_payload(body)
+    for container in (message, body):
+        content = container.get("content")
+        if content is not None:
+            return str(content).strip()
+    return ""
+
+
+def _message_attachments(body: dict[str, Any]) -> list[dict[str, Any]]:
+    message = _message_payload(body)
+    for container in (message, body):
+        attachments = container.get("attachments")
+        if isinstance(attachments, list):
+            return [item for item in attachments if isinstance(item, dict)]
+        if isinstance(attachments, dict):
+            return [attachments]
+    return []
+
+
+def _sender_identifier(body: dict[str, Any]) -> str:
+    message = _message_payload(body)
+    candidates: list[Any] = []
+    for container in (body, message):
+        sender = container.get("sender")
+        if isinstance(sender, dict):
+            candidates.extend([
+                sender.get("phone_number"),
+                sender.get("identifier"),
+                sender.get("source_id"),
+            ])
+    for candidate in candidates:
+        if candidate is not None and str(candidate).strip():
+            return str(candidate).strip()
+    return ""
+
+
+def _session_id(body: dict[str, Any], conversation: dict[str, Any], conversation_id: int) -> str:
+    contact_inbox = conversation.get("contact_inbox") or {}
     candidates = (
-        body.get("id"),
-        body.get("message_id"),
-        body.get("uuid"),
-        body.get("source_id"),
+        contact_inbox.get("source_id") if isinstance(contact_inbox, dict) else None,
+        _sender_identifier(body),
+        conversation_id,
     )
     for candidate in candidates:
         if candidate is not None and str(candidate).strip():
+            return str(candidate).strip()
+    return str(conversation_id)
+
+
+def _message_id(body: dict[str, Any]) -> str:
+    """Return a per-message id without using contact-level source IDs."""
+    cached = body.get("_julia_message_id")
+    if cached is not None and str(cached).strip():
+        return str(cached)
+
+    message = _message_payload(body)
+    candidates = (
+        message.get("id"),
+        body.get("id"),
+        message.get("message_id"),
+        body.get("message_id"),
+        message.get("uuid"),
+        body.get("uuid"),
+    )
+    for candidate in candidates:
+        if candidate is not None and str(candidate).strip():
+            body["_julia_message_id"] = str(candidate)
             return str(candidate)
 
-    conversation = body.get("conversation") or {}
-    return f"{conversation.get('id', 'unknown')}:{time.time_ns()}"
+    conversation = _conversation_payload(body)
+    conversation_id = conversation.get("id", "unknown")
+    created_at = message.get("created_at") or body.get("created_at")
+    content = _message_content(body)
+    attachments = _message_attachments(body)
+    attachment_url = _attachment_url(attachments[0]) if attachments else ""
+
+    if created_at and (content or attachment_url):
+        raw = f"{conversation_id}|{created_at}|{content}|{attachment_url}"
+        digest = hashlib.sha1(raw.encode("utf-8")).hexdigest()[:16]
+        body["_julia_message_id"] = f"{conversation_id}:{digest}"
+        return str(body["_julia_message_id"])
+
+    body["_julia_message_id"] = f"{conversation_id}:{time.time_ns()}"
+    return str(body["_julia_message_id"])
+
+
+def _incoming_message(body: dict[str, Any]) -> bool:
+    msg_type = _message_type(body)
+    if msg_type == 0:
+        return True
+    if isinstance(msg_type, str):
+        return msg_type.strip().lower() in ("incoming", "0")
+    return False
 
 
 def _attachment_url(attachment: dict[str, Any]) -> str:
@@ -956,10 +1115,15 @@ _AREA_LAWYERS = {
 }
 
 
-def _chatwoot_lookup(endpoint: str, target_substring: str, log_label: str) -> int | None:
+def _chatwoot_lookup(
+    endpoint: str,
+    target_substring: str,
+    log_label: str,
+    account_id: str | None = None,
+) -> int | None:
     url = os.environ["CHATWOOT_URL"]
     token = _chatwoot_user_token()
-    account = os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
+    account = account_id or os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
     try:
         with httpx.Client() as http:
             resp = http.get(
@@ -980,14 +1144,14 @@ def _chatwoot_lookup(endpoint: str, target_substring: str, log_label: str) -> in
     return None
 
 
-def _get_chatwoot_team_id(area: str) -> int | None:
+def _get_chatwoot_team_id(area: str, account_id: str | None = None) -> int | None:
     target = _AREA_TEAM_TARGETS.get(area, _AREA_TEAM_TARGETS["previdenciario"])
-    return _chatwoot_lookup("teams", target, "teams")
+    return _chatwoot_lookup("teams", target, "teams", account_id=account_id)
 
 
-def _get_chatwoot_agent_id(area: str) -> int | None:
+def _get_chatwoot_agent_id(area: str, account_id: str | None = None) -> int | None:
     target = _AREA_AGENT_TARGETS.get(area, _AREA_AGENT_TARGETS["previdenciario"])
-    return _chatwoot_lookup("agents", target, "agents")
+    return _chatwoot_lookup("agents", target, "agents", account_id=account_id)
 
 
 def _build_transfer_note(
@@ -1022,6 +1186,7 @@ def _build_transfer_note(
 
 def _transfer_to_lawyer(
     conversation_id: int,
+    account_id: str | None,
     area: str,
     subarea: str,
     client_name: str,
@@ -1034,12 +1199,12 @@ def _transfer_to_lawyer(
 ) -> dict[str, Any]:
     url = os.environ["CHATWOOT_URL"]
     user_token = _chatwoot_user_token()
-    account = os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
+    account = account_id or os.environ.get("CHATWOOT_ACCOUNT_ID", "1")
     lawyer, lawyer_wa, area_label = _AREA_LAWYERS.get(area, _AREA_LAWYERS["previdenciario"])
 
     try:
-        team_id = _get_chatwoot_team_id(area)
-        agent_id = _get_chatwoot_agent_id(area)
+        team_id = _get_chatwoot_team_id(area, account_id=account)
+        agent_id = _get_chatwoot_agent_id(area, account_id=account)
 
         note = _build_transfer_note(
             client_name=client_name,
@@ -1076,7 +1241,7 @@ def _transfer_to_lawyer(
                 if r.status_code >= 400:
                     assign_errors.append(f"agent POST {r.status_code}: {r.text[:200]}")
 
-        _chatwoot_post_message(conversation_id, note, private=True)
+        _chatwoot_post_message(conversation_id, note, private=True, account_id=account)
 
         assign_info = f" | assign_errors: {assign_errors}" if assign_errors else ""
         print(f"[transfer] team_id={team_id} agent_id={agent_id}{assign_info}")
@@ -1100,19 +1265,20 @@ def _run_julia_and_send(
     session_id: str,
     user_text: str,
     conversation_id: int,
+    account_id: str | None = None,
 ) -> None:
     """Abre conexão, chama Júlia, envia resposta e aplica label final se transferido."""
     conn = psycopg2.connect(os.environ["POSTGRES_URL"])
     try:
         _init_db(conn)
-        ai_response, was_transferred = _call_julia(conn, session_id, user_text, conversation_id)
+        ai_response, was_transferred = _call_julia(conn, session_id, user_text, conversation_id, account_id)
     finally:
         conn.close()
 
-    _send_text(conversation_id, session_id, ai_response)
+    _send_text(conversation_id, session_id, ai_response, account_id=account_id)
 
     if was_transferred:
-        _chatwoot_set_labels(conversation_id, ["transferido"])
+        _chatwoot_set_labels(conversation_id, ["transferido"], account_id=account_id)
 
 
 def _wait_for_image_silence(redis_client: Any, key: str, msg_id: str) -> bool:
@@ -1152,65 +1318,114 @@ def process_message(body: dict) -> None:
     import traceback
 
     try:
+        print(
+            "[webhook:received]",
+            {
+                "event": _event_name(body),
+                "message_type": _message_type(body),
+                "message_id": _message_id(body),
+                "conversation_id": _conversation_payload(body).get("id"),
+                "account_id": _account_id(body),
+                "sender_type": _sender_type(body),
+                "content": _message_content(body),
+                "attachments": len(_message_attachments(body)),
+            },
+        )
         _process(body, redis_lib, psycopg2)
-        print("BODY:", body)
-        print("CONTENT:", body.get("content"))
-        print("ATTACHMENTS:", body.get("attachments"))
+        print(f"[webhook:done] message_id={_message_id(body)!r}")
 
     except Exception:
         traceback.print_exc()
+        raise
 
 
 def _process(body: dict[str, Any], redis_lib: Any, psycopg2: Any) -> None:
-    # Agent Bot payload: message fields are at body root level
-    msg_type = body.get("message_type")
+    event = _event_name(body)
+    if event and event != "message_created":
+        _debug_skip("event", event=event, id=body.get("id"))
+        return
+
+    msg_type = _message_type(body)
 
     # Only process incoming messages; ignore outgoing/activity to avoid infinite loops
-    if msg_type not in (0, "incoming"):
-        _debug_skip("message_type", message_type=msg_type, event=body.get("event"), id=body.get("id"))
+    if not _incoming_message(body):
+        _debug_skip("message_type", message_type=msg_type, event=event, id=body.get("id"))
         return
 
     # Ignore messages sent by human agents or the bot itself — only process customer messages
-    sender_type = (body.get("sender") or {}).get("type", "")
-    if sender_type in ("agent_bot", "bot"):
+    sender_type = _sender_type(body)
+    if sender_type in ("agent_bot", "bot", "user", "agent"):
         _debug_skip("sender_type", sender_type=sender_type, id=body.get("id"))
         return
 
-    conversation = body.get("conversation") or {}
+    conversation = _conversation_payload(body)
     conversation_id = conversation.get("id")
     if not conversation_id:
         _debug_skip("missing_conversation_id", id=body.get("id"))
         return
+    conversation_id = int(conversation_id)
+
+    account_id = _account_id(body)
 
     # Stop only if a human explicitly added the "atendimento_humano" label
     # (avoid blocking on auto-assignment caused by the bot's own API token)
     labels = conversation.get("labels") or []
-    if "atendimento_humano" in labels:
-        _debug_skip("human_label", conversation_id=conversation_id, labels=labels)
+    session_id = _session_id(body, conversation, conversation_id)
+    msg_id = _message_id(body)
+
+    if "transferido" in labels:
+        _debug_skip(
+            "transferred_label",
+            conversation_id=conversation_id,
+            msg_id=msg_id,
+            session_id=session_id,
+            labels=labels,
+        )
         return
 
-    # session_id: prefer WhatsApp source_id, fall back to conversation id
-    # An empty session_id would merge all conversations into one history
-    session_id = (
-        (conversation.get("contact_inbox") or {}).get("source_id")
-        or str(conversation_id or "")
-        or body.get("source_id", "")
-    )
+    if "atendimento_humano" in labels:
+        _debug_skip(
+            "human_label",
+            conversation_id=conversation_id,
+            msg_id=msg_id,
+            session_id=session_id,
+            labels=labels,
+        )
+        return
 
-    message_content = body.get("content") or ""
-    attachments = body.get("attachments") or []
+    message_content = _message_content(body)
+    attachments = _message_attachments(body)
     first_att = attachments[0] if attachments else {}
     file_type = first_att.get("file_type") or ""
     data_url = _attachment_url(first_att)
-    msg_id = _message_id(body)
 
     # Deduplication: ignore if this exact message was already processed
     r = redis_lib.from_url(os.environ["REDIS_URL"])
     if not r.set(f"dedup:{msg_id}", "1", nx=True, ex=REDIS_DEDUP_TTL):
-        _debug_skip("duplicate", msg_id=msg_id, source_id=body.get("source_id"), id=body.get("id"))
+        _debug_skip(
+            "duplicate",
+            msg_id=msg_id,
+            session_id=session_id,
+            conversation_id=conversation_id,
+            id=body.get("id"),
+        )
         return  # another invocation already claimed this message
 
-    _chatwoot_open_conversation(conversation_id)
+    print(
+        "[webhook:process]",
+        {
+            "event": event or None,
+            "conversation_id": conversation_id,
+            "account_id": account_id,
+            "session_id": session_id,
+            "msg_id": msg_id,
+            "file_type": file_type or None,
+            "has_text": bool(message_content),
+            "has_attachment_url": bool(data_url),
+        },
+    )
+
+    _chatwoot_open_conversation(conversation_id, account_id=account_id)
 
     # --- Image debounce: coleta imagens e espera silêncio desde a última ---
     if file_type == "image":
@@ -1241,13 +1456,19 @@ def _process(body: dict[str, Any], redis_lib: Any, psycopg2: Any) -> None:
             _debug_skip("image_without_extracted_text", conversation_id=conversation_id, msg_id=msg_id)
             return
 
-        _run_julia_and_send(psycopg2, session_id, "\n\n".join(img_texts), conversation_id)
+        _run_julia_and_send(
+            psycopg2,
+            session_id,
+            "\n\n".join(img_texts),
+            conversation_id,
+            account_id=account_id,
+        )
         return
 
     text_message = _extract_text(file_type, message_content, data_url)
     if not text_message:
         if file_type == "audio":
-            _send_text(conversation_id, session_id, AUDIO_MSG)
+            _send_text(conversation_id, session_id, AUDIO_MSG, account_id=account_id)
         _debug_skip("empty_text", conversation_id=conversation_id, msg_id=msg_id, file_type=file_type, has_url=bool(data_url))
         return
 
@@ -1266,12 +1487,12 @@ def _process(body: dict[str, Any], redis_lib: Any, psycopg2: Any) -> None:
     r.delete(session_id)
     r.delete(last_key)
 
-    _run_julia_and_send(psycopg2, session_id, all_text, conversation_id)
+    _run_julia_and_send(psycopg2, session_id, all_text, conversation_id, account_id=account_id)
 
 
 @app.function(image=image, secrets=secrets)
 @modal.fastapi_endpoint(method="POST")
 async def webhook(body: dict) -> dict[str, str]:
-    """Receives Chatwoot webhook events and processes them asynchronously."""
-    await process_message.spawn.aio(body)
-    return {"status": "received"}
+    """Receives Chatwoot webhook events and waits for processing in debug mode."""
+    await process_message.remote.aio(body)
+    return {"status": "processed"}

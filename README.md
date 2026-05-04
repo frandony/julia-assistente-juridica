@@ -117,6 +117,7 @@ julia-assistente-juridica-main/
 ## Desenvolvedor
 
 **Francisco Gomes** — frandonny dev
+franciscogomes.com
 franc2007vga@gmail.com
 
 ## Escritório

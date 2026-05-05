@@ -51,21 +51,21 @@ WhatsApp (cliente)
 
 ### Secret: `marina-secrets`
 
-| Variável | Descrição |
-|---|---|
-| `ANTHROPIC_API_KEY` | Chave da API da Anthropic |
-| `CHATWOOT_URL` | URL base do Chatwoot (ex: `https://app.chatwoot.com`) |
-| `CHATWOOT_TOKEN` | Token de acesso à API do Chatwoot |
-| `CHATWOOT_USER_TOKEN` | Token de usuário admin (para atribuição de equipe/agente) |
-| `CHATWOOT_ACCOUNT_ID` | ID da conta no Chatwoot (padrão: `1`) |
-| `REDIS_URL` | URL de conexão Redis (ex: `redis://...`) |
-| `POSTGRES_URL` | URL de conexão PostgreSQL |
+| Variável | O que é | Onde obter |
+|---|---|---|
+| `ANTHROPIC_API_KEY` | Chave da API da Anthropic. Usada para chamar o Claude Haiku (respostas da Júlia) e Claude Vision (leitura de imagens e PDFs). | [console.anthropic.com](https://console.anthropic.com) → API Keys |
+| `CHATWOOT_URL` | URL base da sua instância Chatwoot, **sem barra no final** (ex: `https://app.chatwoot.com`). Prefixo de todas as chamadas REST. | Endereço que você acessa para entrar no Chatwoot |
+| `CHATWOOT_TOKEN` | Token do **agente bot** (bot token). Usado para enviar mensagens aos clientes e aplicar etiquetas. Tem permissão de bot, não de admin. | Chatwoot → Configurações → Integrações → Agente Bot → copiar o token do bot |
+| `CHATWOOT_USER_TOKEN` | Token de acesso pessoal do **usuário administrador**. Necessário para atribuir equipes e agentes na transferência (operação que exige permissão de admin). Se omitido, usa `CHATWOOT_TOKEN` como fallback (transferência pode falhar). | Chatwoot → Perfil (canto inferior esquerdo) → Token de Acesso |
+| `CHATWOOT_ACCOUNT_ID` | ID numérico da conta no Chatwoot. Na maioria das instalações é `1`. Visível na URL após o login: `.../app/accounts/`**1**`/...`. | URL do Chatwoot após o login |
+| `REDIS_URL` | URL de conexão Redis com credenciais (formato: `redis://:senha@host:6379` ou `rediss://...` para TLS). Usado para debounce de mensagens (agrega envios rápidos em um único processamento) e deduplicação de eventos duplicados do Chatwoot. | Provedor Redis (Upstash, Redis Cloud, etc.) → Connection String |
+| `POSTGRES_URL` | URL de conexão PostgreSQL com credenciais (formato: `postgresql://usuario:senha@host:5432/banco`). Armazena o histórico de conversas por número de WhatsApp, persistindo contexto entre sessões. | Provedor Postgres (Supabase, Neon, Railway, etc.) → Connection String |
 
 ### Secret: `groq-secrets`
 
-| Variável | Descrição |
-|---|---|
-| `GROQ_API_KEY` | Chave da API da Groq (transcrição de áudio via Whisper) |
+| Variável | O que é | Onde obter |
+|---|---|---|
+| `GROQ_API_KEY` | Chave da API da Groq. Usada exclusivamente para transcrever mensagens de voz via modelo Whisper large-v3-turbo. Sem essa chave, áudios recebem mensagem de fallback pedindo texto. | [console.groq.com](https://console.groq.com) → API Keys |
 
 ## Instalação e Deploy
 

@@ -102,6 +102,7 @@ TRANSFER_TO_LAWYER_TOOL = {
 }
 
 AUDIO_MSG = "Recebi seu áudio, mas não consegui transcrever. Por favor, envie sua mensagem em texto."
+UNSUPPORTED_MSG = "Recebi sua mensagem, mas não consigo processar esse tipo de arquivo. Por favor, envie em texto, áudio, imagem (JPG/PNG) ou documento PDF."
 
 JULIA_SYSTEM_PROMPT = """# REGRA ABSOLUTA — ENCERRAMENTO APÓS TRANSFERÊNCIA
 
@@ -932,6 +933,9 @@ def _send_text(
     text: str,
     account_id: str | None = None,
 ) -> None:
+    if not text or not text.strip():
+        print(f"[send_text:skip] empty text for conversation_id={conversation_id!r}")
+        return
     cleaned = _strip_markdown(text)
     parts = [p.strip() for p in cleaned.split("\n\n") if p.strip()]
 
@@ -1469,6 +1473,9 @@ def _process(body: dict[str, Any], redis_lib: Any, psycopg2: Any) -> None:
     if not text_message:
         if file_type == "audio":
             _send_text(conversation_id, session_id, AUDIO_MSG, account_id=account_id)
+        elif file_type:
+            # vídeo, sticker, GIF ou outro tipo não suportado — avisa o cliente em vez de silêncio
+            _send_text(conversation_id, session_id, UNSUPPORTED_MSG, account_id=account_id)
         _debug_skip("empty_text", conversation_id=conversation_id, msg_id=msg_id, file_type=file_type, has_url=bool(data_url))
         return
 

@@ -741,7 +741,8 @@ def _chatwoot_env() -> tuple[str, str, str]:
 
 
 def _chatwoot_set_labels(conversation_id: int, labels: list[str], account_id: str | None = None) -> None:
-    url, token, default_account = _chatwoot_env()
+    url, _, default_account = _chatwoot_env()
+    token = _chatwoot_user_token()  # label operations require admin permission
     account = account_id or default_account
     with httpx.Client() as http:
         r = http.post(
@@ -1430,6 +1431,13 @@ def _process(body: dict[str, Any], redis_lib: Any, psycopg2: Any) -> None:
     )
 
     _chatwoot_open_conversation(conversation_id, account_id=account_id)
+
+    # Aplica "conversando" imediatamente na primeira mensagem (sem labels ainda)
+    if not labels:
+        try:
+            _chatwoot_set_labels(conversation_id, ["conversando"], account_id=account_id)
+        except Exception as e:
+            print(f"[chatwoot:set_label_conversando_error] conversation_id={conversation_id!r} error={e!r}")
 
     # --- Image debounce: coleta imagens e espera silêncio desde a última ---
     if file_type == "image":

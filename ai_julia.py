@@ -103,6 +103,9 @@ TRANSFER_TO_LAWYER_TOOL = {
 
 AUDIO_MSG = "Recebi seu áudio, mas não consegui transcrever. Por favor, envie sua mensagem em texto."
 UNSUPPORTED_MSG = "Recebi sua mensagem, mas não consigo processar esse tipo de arquivo. Por favor, envie em texto, áudio, imagem (JPG/PNG) ou documento PDF."
+ERROR_MSG = "Olá! Tive uma instabilidade técnica ao processar sua mensagem. Por favor, tente novamente em instantes."
+
+MAX_TOOL_ITERATIONS = 10
 
 JULIA_SYSTEM_PROMPT = """# REGRA ABSOLUTA — ENCERRAMENTO APÓS TRANSFERÊNCIA
 
@@ -850,8 +853,14 @@ def _call_julia(
     ]
 
     was_transferred = False
+    _iterations = 0
 
     while True:
+        _iterations += 1
+        if _iterations > MAX_TOOL_ITERATIONS:
+            print(f"[call_julia:max_iterations] session_id={session_id!r} conversation_id={conversation_id!r}")
+            return "", was_transferred
+
         resp = client.messages.create(
             model=CLAUDE_MODEL,
             max_tokens=CLAUDE_MAX_TOKENS,
@@ -1468,13 +1477,18 @@ def _process(body: dict[str, Any], redis_lib: Any, psycopg2: Any) -> None:
             _debug_skip("image_without_extracted_text", conversation_id=conversation_id, msg_id=msg_id)
             return
 
-        _run_julia_and_send(
-            psycopg2,
-            session_id,
-            "\n\n".join(img_texts),
-            conversation_id,
-            account_id=account_id,
-        )
+        try:
+            _run_julia_and_send(
+                psycopg2,
+                session_id,
+                "\n\n".join(img_texts),
+                conversation_id,
+                account_id=account_id,
+            )
+        except Exception as e:
+            print(f"[run_julia_error:image] conversation_id={conversation_id!r} error={e!r}")
+            _send_text(conversation_id, session_id, ERROR_MSG, account_id=account_id)
+            raise
         return
 
     text_message = _extract_text(file_type, message_content, data_url)
@@ -1502,7 +1516,12 @@ def _process(body: dict[str, Any], redis_lib: Any, psycopg2: Any) -> None:
     r.delete(session_id)
     r.delete(last_key)
 
-    _run_julia_and_send(psycopg2, session_id, all_text, conversation_id, account_id=account_id)
+    try:
+        _run_julia_and_send(psycopg2, session_id, all_text, conversation_id, account_id=account_id)
+    except Exception as e:
+        print(f"[run_julia_error:text] conversation_id={conversation_id!r} error={e!r}")
+        _send_text(conversation_id, session_id, ERROR_MSG, account_id=account_id)
+        raise
 
 
 @app.function(image=image, secrets=secrets)

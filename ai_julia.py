@@ -854,12 +854,13 @@ def _call_julia(
 
     was_transferred = False
     _iterations = 0
+    _pending_text = ""  # texto gerado junto com tool_use num turno misto
 
     while True:
         _iterations += 1
         if _iterations > MAX_TOOL_ITERATIONS:
             print(f"[call_julia:max_iterations] session_id={session_id!r} conversation_id={conversation_id!r}")
-            return "", was_transferred
+            break
 
         resp = client.messages.create(
             model=CLAUDE_MODEL,
@@ -873,6 +874,10 @@ def _call_julia(
         text_block = next((b for b in resp.content if b.type == "text"), None)
 
         if tool_blocks:
+            # Salva texto do turno misto (texto + tool_use) como fallback
+            if text_block and text_block.text.strip():
+                _pending_text = text_block.text.strip()
+
             tool_results = []
             for tool_block in tool_blocks:
                 tool_name = tool_block.name
@@ -915,11 +920,17 @@ def _call_julia(
             messages.append({"role": "user", "content": tool_results})
             continue
 
-        # No tool_use block — final text response
-        ai_text = text_block.text if text_block else ""
+        # Turno sem tool_use — resposta final
+        ai_text = (text_block.text if text_block else "") or _pending_text
         if ai_text:
             _save_turn(conn, session_id, user_message, ai_text)
         return ai_text, was_transferred
+
+    # Saiu por max_iterations — usa texto pendente se houver
+    ai_text = _pending_text
+    if ai_text:
+        _save_turn(conn, session_id, user_message, ai_text)
+    return ai_text, was_transferred
 
 
 # ---------------------------------------------------------------------------
